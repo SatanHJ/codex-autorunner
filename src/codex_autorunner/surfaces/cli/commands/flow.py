@@ -731,6 +731,12 @@ def register_flow_commands(
         force_new: bool = typer.Option(
             False, "--force-new", help="Always create a new run"
         ),
+        max_total_turns: Optional[int] = typer.Option(
+            None,
+            "--max-total-turns",
+            min=1,
+            help="Maximum total agent turns before pausing the run.",
+        ),
     ):
         """Bootstrap ticket_flow (seed TICKET-001 if needed) and start a run."""
         engine = require_repo_config(repo, hub)
@@ -813,9 +819,12 @@ You are the first ticket in a new ticket_flow run.
         controller, agent_pool = _ticket_flow_controller(engine)
         try:
             run_id = str(uuid.uuid4())
+            input_data: dict[str, object] = {}
+            if max_total_turns is not None:
+                input_data["max_total_turns"] = max_total_turns
             record = asyncio.run(
                 controller.start_flow(
-                    input_data={},
+                    input_data=input_data,
                     run_id=run_id,
                     metadata={"seeded_ticket": seeded},
                 )
@@ -860,6 +869,12 @@ You are the first ticket in a new ticket_flow run.
         hub: Optional[Path] = typer.Option(None, "--hub", help="Hub root path"),
         force_new: bool = typer.Option(
             False, "--force-new", help="Always create a new run"
+        ),
+        max_total_turns: Optional[int] = typer.Option(
+            None,
+            "--max-total-turns",
+            min=1,
+            help="Maximum total agent turns before pausing the run.",
         ),
     ):
         """Start or resume the latest ticket_flow run."""
@@ -926,7 +941,9 @@ You are the first ticket in a new ticket_flow run.
         controller, agent_pool = _ticket_flow_controller(engine)
         try:
             run_id = str(uuid.uuid4())
-            input_data = {"workspace_root": str(engine.repo_root)}
+            input_data: dict[str, object] = {"workspace_root": str(engine.repo_root)}
+            if max_total_turns is not None:
+                input_data["max_total_turns"] = max_total_turns
             record = asyncio.run(
                 controller.start_flow(input_data=input_data, run_id=run_id)
             )

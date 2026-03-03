@@ -98,16 +98,13 @@ echo "Linting JS/TS (eslint)..."
 echo "Build static assets (pnpm run build)..."
 pnpm run build
 
-echo "Checking generated static assets are committed..."
-# Treat compiled JS (and maps) in the static folder as generated outputs that must stay in sync.
-GENERATED_STATIC=$(find src/codex_autorunner/static -maxdepth 1 -type f \( -name '*.js' -o -name '*.js.map' \) | sort)
-
-if [ -n "$GENERATED_STATIC" ]; then
-  # shellcheck disable=SC2086 # git diff needs separate args
-  if ! git diff --exit-code -- $GENERATED_STATIC >/dev/null 2>&1; then
-    echo "Generated static assets are out of date. Run 'pnpm run build' and commit updated JS outputs." >&2
-    # shellcheck disable=SC2086
-    git diff --stat -- $GENERATED_STATIC >&2
+echo "Checking asset manifest is committed..."
+# Verify the manifest is in sync with the generated assets.
+# The manifest is the source of truth for frontend assets.
+if [ -f src/codex_autorunner/static/assets.json ]; then
+  if ! git diff --exit-code -- src/codex_autorunner/static/assets.json >/dev/null 2>&1; then
+    echo "Asset manifest is out of date. Run 'pnpm run build' and commit updated manifest." >&2
+    git diff --stat -- src/codex_autorunner/static/assets.json >&2
     exit 1
   fi
 fi

@@ -333,6 +333,7 @@ class _SavedDiscordAttachment:
     path: Path
     mime_type: Optional[str]
     size_bytes: int
+    is_audio: bool
     transcript_text: Optional[str] = None
     transcript_warning: Optional[str] = None
 
@@ -1295,6 +1296,9 @@ class DiscordBotService:
                 if not Path(transcription_name).suffix:
                     transcription_name = path.name
                 mime_type = getattr(attachment, "mime_type", None)
+                is_audio = self._is_audio_attachment(
+                    attachment, mime_type if isinstance(mime_type, str) else None
+                )
                 transcript_text, transcript_warning = (
                     await self._transcribe_voice_attachment(
                         workspace_root=workspace_root,
@@ -1311,6 +1315,7 @@ class DiscordBotService:
                         path=path,
                         mime_type=mime_type if isinstance(mime_type, str) else None,
                         size_bytes=len(data),
+                        is_audio=is_audio,
                         transcript_text=transcript_text,
                         transcript_warning=transcript_warning,
                     )
@@ -1373,18 +1378,19 @@ class DiscordBotService:
                     wrap_injected_context(DISCORD_WHISPER_TRANSCRIPT_DISCLAIMER)
                 )
 
-        details.append("")
-        details.append(
-            wrap_injected_context(
-                "\n".join(
-                    [
-                        f"Inbox: {inbox}",
-                        f"Outbox (pending): {outbox_pending_dir(workspace_root)}",
-                        "Use inbox files as local inputs and place reply files in outbox (pending).",
-                    ]
+        if any(not item.is_audio for item in saved):
+            details.append("")
+            details.append(
+                wrap_injected_context(
+                    "\n".join(
+                        [
+                            f"Inbox: {inbox}",
+                            f"Outbox (pending): {outbox_pending_dir(workspace_root)}",
+                            "Use inbox files as local inputs and place reply files in outbox (pending).",
+                        ]
+                    )
                 )
             )
-        )
         attachment_context = "\n".join(details)
 
         if prompt_text.strip():

@@ -296,8 +296,14 @@ _normalize_voice_provider() {
   normalized="${normalized%\'}"
   normalized="${normalized#\'}"
   case "${normalized}" in
-    ""|local|local_whisper)
+    "")
       echo "local_whisper"
+      ;;
+    local|local_whisper)
+      echo "local_whisper"
+      ;;
+    mlx|mlx_whisper)
+      echo "mlx_whisper"
       ;;
     *)
       echo "${normalized}"
@@ -309,6 +315,9 @@ _voice_provider_for_hub_root() {
   local root provider
   root="$1"
   provider="$(_dotenv_value "${root}" "CODEX_AUTORUNNER_VOICE_PROVIDER" || true)"
+  if [[ -z "${provider}" ]]; then
+    provider="$(_config_python "${root}" "repo_defaults.voice.provider" || true)"
+  fi
   if [[ -z "${provider}" ]]; then
     provider="$(_config_python "${root}" "voice.provider" || true)"
   fi
@@ -443,6 +452,8 @@ if [[ -n "${HUB_ROOT}" ]]; then
   VOICE_PROVIDER="$(_voice_provider_for_hub_root "${HUB_ROOT}")"
   if [[ "${VOICE_PROVIDER}" == "local_whisper" ]]; then
     PACKAGE_INSTALL_SPEC="${PACKAGE_SRC}[voice-local]"
+  elif [[ "${VOICE_PROVIDER}" == "mlx_whisper" ]]; then
+    PACKAGE_INSTALL_SPEC="${PACKAGE_SRC}[voice-mlx]"
   fi
 fi
 

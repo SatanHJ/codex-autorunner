@@ -1160,6 +1160,7 @@ class DiscordBotService:
 
         if isinstance(turn_result, DiscordMessageTurnResult):
             response_text = turn_result.final_message
+            preview_message_id = turn_result.preview_message_id
             metrics_text = _format_turn_metrics(
                 turn_result.token_usage,
                 turn_result.elapsed_seconds,
@@ -1171,6 +1172,7 @@ class DiscordBotService:
                     response_text = f"(No response text returned.)\n\n{metrics_text}"
         else:
             response_text = str(turn_result or "")
+            preview_message_id = None
 
         chunks = chunk_discord_message(
             response_text or "(No response text returned.)",
@@ -1184,6 +1186,12 @@ class DiscordBotService:
                 channel_id,
                 {"content": chunk},
                 record_id=f"turn:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
+            )
+        if isinstance(preview_message_id, str) and preview_message_id:
+            await self._delete_channel_message_safe(
+                channel_id=channel_id,
+                message_id=preview_message_id,
+                record_id=f"turn:delete_progress:{session_key}:{uuid.uuid4().hex[:8]}",
             )
         await self._flush_outbox_files(
             workspace_root=workspace_root,
@@ -2023,6 +2031,7 @@ class DiscordBotService:
         progress_last_updated = 0.0
         progress_failure_count = 0
         progress_heartbeat_task: Optional[asyncio.Task[None]] = None
+        active_progress_labels = {"working", "queued", "running", "review"}
 
         async def _edit_progress(
             *,
@@ -2054,8 +2063,10 @@ class DiscordBotService:
             payload: dict[str, Any] = {"content": content}
             if remove_components:
                 payload["components"] = []
-            else:
+            elif tracker.label in active_progress_labels:
                 payload["components"] = [build_cancel_turn_button()]
+            else:
+                payload["components"] = []
             try:
                 await self._rest.edit_channel_message(
                     channel_id=progress_channel_id,
@@ -2270,6 +2281,14 @@ class DiscordBotService:
                 progress_heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await progress_heartbeat_task
+        if not error_message and not completed_seen:
+            tracker.clear_transient_action()
+            tracker.set_label("done")
+            await _edit_progress(
+                force=True,
+                remove_components=True,
+                render_mode="final",
+            )
         if session_from_events:
             orchestrator.set_thread_id(session_key, session_from_events)
         if error_message:
@@ -8445,6 +8464,14 @@ class DiscordBotService:
                 channel_id,
                 {"content": chunk},
                 record_id=f"review:{session_key}:{idx}:{uuid.uuid4().hex[:8]}",
+            )
+        if isinstance(preview_message_id, str) and preview_message_id:
+            await self._delete_channel_message_safe(
+                channel_id=channel_id,
+                message_id=preview_message_id,
+                record_id=(
+                    f"review:delete_progress:{session_key}:{uuid.uuid4().hex[:8]}"
+                ),
             )
 
         try:

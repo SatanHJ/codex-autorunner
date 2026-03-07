@@ -28,6 +28,7 @@ from codex_autorunner.core.ports.run_event import (
     Completed,
     Failed,
     OutputDelta,
+    RunNotice,
     Started,
     TokenUsage,
     ToolCall,
@@ -2141,7 +2142,7 @@ async def test_message_create_streaming_turn_final_progress_omits_duplicate_term
 
 
 @pytest.mark.anyio
-async def test_message_create_streaming_turn_completion_sends_final_and_keeps_preview(
+async def test_message_create_streaming_turn_completion_sends_final_and_deletes_preview(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -2182,13 +2183,66 @@ async def test_message_create_streaming_turn_completion_sends_final_and_keeps_pr
 
     try:
         await service.run_forever()
-        assert rest.deleted_channel_messages == []
+        assert len(rest.deleted_channel_messages) == 1
+        assert rest.deleted_channel_messages[0]["message_id"] == "msg-1"
         assert rest.edited_channel_messages
         assert rest.edited_channel_messages[-1]["payload"].get("components") == []
         assert any(
             final_text in msg["payload"].get("content", "")
             for msg in rest.channel_messages
         )
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_message_create_streaming_turn_keeps_components_cleared_after_completion(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id=None,
+    )
+    rest = _FakeRest()
+    gateway = _FakeGateway([("MESSAGE_CREATE", _message_create("ship it"))])
+    service = DiscordBotService(
+        _config(tmp_path),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+    orchestrator = _StreamingFakeOrchestrator(
+        [
+            Started(timestamp="2026-01-01T00:00:00Z", session_id="thread-1"),
+            OutputDelta(timestamp="2026-01-01T00:00:01Z", content="thinking"),
+            Completed(timestamp="2026-01-01T00:00:02Z", final_message="done"),
+            RunNotice(
+                timestamp="2026-01-01T00:00:03Z",
+                kind="notice",
+                message="late notice",
+            ),
+        ]
+    )
+
+    async def _fake_orchestrator_for_workspace(*args: Any, **kwargs: Any):
+        _ = args, kwargs
+        return orchestrator
+
+    service._orchestrator_for_workspace = _fake_orchestrator_for_workspace  # type: ignore[assignment]
+
+    try:
+        await service.run_forever()
+        assert rest.edited_channel_messages
+        assert rest.edited_channel_messages[-1]["payload"].get("components") == []
     finally:
         await store.close()
 
@@ -2422,7 +2476,7 @@ async def test_message_create_streaming_turn_failure_before_completion_still_fai
 
 
 @pytest.mark.anyio
-async def test_message_create_streaming_turn_multi_chunk_keeps_preview_and_sends_chunks(
+async def test_message_create_streaming_turn_multi_chunk_deletes_preview_and_sends_chunks(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -2465,7 +2519,8 @@ async def test_message_create_streaming_turn_multi_chunk_keeps_preview_and_sends
 
     try:
         await service.run_forever()
-        assert rest.deleted_channel_messages == []
+        assert len(rest.deleted_channel_messages) == 1
+        assert rest.deleted_channel_messages[0]["message_id"] == "msg-1"
         final_sends = [
             op
             for op in rest.message_ops
@@ -3043,7 +3098,8 @@ async def test_message_create_progress_edit_failures_are_best_effort_and_throttl
     try:
         await service.run_forever()
         assert 1 <= rest.edit_attempts <= 2
-        assert rest.deleted_channel_messages == []
+        assert len(rest.deleted_channel_messages) == 1
+        assert rest.deleted_channel_messages[0]["message_id"] == "msg-1"
         assert any(
             final_text in msg["payload"].get("content", "")
             for msg in rest.channel_messages
@@ -3053,7 +3109,7 @@ async def test_message_create_progress_edit_failures_are_best_effort_and_throttl
 
 
 @pytest.mark.anyio
-async def test_message_create_streaming_turn_does_not_attempt_preview_delete(
+async def test_message_create_streaming_turn_enqueues_preview_delete_when_delete_fails(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -3099,7 +3155,7 @@ async def test_message_create_streaming_turn_does_not_attempt_preview_delete(
             for msg in rest.channel_messages
         )
         pending = await store.list_outbox()
-        assert all(record.operation != "delete" for record in pending)
+        assert any(record.operation == "delete" for record in pending)
     finally:
         await store.close()
 
@@ -4280,7 +4336,7 @@ async def test_message_create_enqueues_outbox_when_channel_send_fails(
 
 
 @pytest.mark.anyio
-async def test_car_review_single_chunk_keeps_preview_and_sends_chunk_when_flush_fails(
+async def test_car_review_single_chunk_deletes_preview_and_sends_chunk_when_flush_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -4360,7 +4416,8 @@ async def test_car_review_single_chunk_keeps_preview_and_sends_chunk_when_flush_
             options={},
         )
         assert rest.edited_channel_messages == []
-        assert rest.deleted_channel_messages == []
+        assert len(rest.deleted_channel_messages) == 1
+        assert rest.deleted_channel_messages[0]["message_id"] == "preview-1"
         assert any(
             "single chunk review response" in msg["payload"].get("content", "")
             for msg in rest.channel_messages

@@ -22,7 +22,10 @@ def test_render_screenshot_help_mentions_mode_readiness_and_cleanup() -> None:
     assert "--url" in output
     assert "--serve-cmd" in output
     assert "--ready-url" in output
-    assert "CAR tears it down on" in output
+    assert "--project-root" in output
+    assert "--project-context" in output
+    assert "no-project-conte" in output
+    assert "tears it down on" in output
     assert "every exit path." in output
 
 
@@ -35,7 +38,16 @@ def test_render_demo_help_mentions_manifest_and_artifacts_options() -> None:
     assert "Locator priority" in output
     assert "--record-video" in output
     assert "--trace" in output
+    assert "--preflight" in output
+    assert "--preflight-only" in output
+    assert "--preflight-report" in output
+    assert "--session-id" in output
+    assert "--keep-session" in output
+    assert "--attach-session" in output
     assert "--full-artifacts" in output
+    assert "--project-root" in output
+    assert "--project-context" in output
+    assert "no-project-conte" in output
 
 
 def test_render_observe_help_mentions_serve_mode_readiness_and_cleanup() -> None:
@@ -45,5 +57,20 @@ def test_render_observe_help_mentions_serve_mode_readiness_and_cleanup() -> None
     assert result.exit_code == 0
     assert "--serve-cmd" in output
     assert "--ready-url" in output
-    assert "CAR tears it down on" in output
+    assert "--project-root" in output
+    assert "--project-context" in output
+    assert "no-project-conte" in output
+    assert "tears it down on" in output
     assert "every exit path." in output
+
+
+def test_render_demo_workflow_help_mentions_workflow_and_outbox_options() -> None:
+    result = runner.invoke(app, ["render", "demo-workflow", "--help"])
+    output = _plain(result.stdout)
+
+    assert result.exit_code == 0
+    assert "--workflow" in output
+    assert "--out-dir" in output
+    assert "--outbox-dir" in output
+    assert "--publish-outbox" in output
+    assert "--no-publish-outbox" in output

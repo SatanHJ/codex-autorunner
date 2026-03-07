@@ -23,6 +23,29 @@ def _normalize_text(value: str) -> str:
     return " ".join(value.split()).strip()
 
 
+def _truncate_tail(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[-limit:]
+    return f"...{text[-(limit - 3):]}"
+
+
+def _merge_output_text(current: str, incoming: str) -> str:
+    if not current:
+        return incoming
+    if incoming.startswith(current):
+        return incoming
+    if current.endswith(incoming):
+        return current
+    if incoming in current:
+        return current
+    separator = "" if current.endswith((".", "!", "?", ":", ";", ",")) else " "
+    return f"{current}{separator}{incoming}"
+
+
 @dataclass
 class ProgressAction:
     label: str
@@ -43,9 +66,10 @@ class TurnProgressTracker:
     actions: list[ProgressAction] = field(default_factory=list)
     step: int = 0
     last_output_index: Optional[int] = None
-    last_thinking_index: Optional[int] = None
     context_usage_percent: Optional[int] = None
     finalized: bool = False
+    output_buffer: str = ""
+    transient_action: Optional[ProgressAction] = None
 
     def set_label(self, label: str) -> None:
         if label:
@@ -65,12 +89,26 @@ class TurnProgressTracker:
         *,
         item_id: Optional[str] = None,
         track_output: bool = False,
-        track_thinking: bool = False,
         subagent_label: Optional[str] = None,
     ) -> None:
         normalized = _normalize_text(text)
         if not normalized:
             return
+        if label in {"thinking", "tool", "command"}:
+            self.transient_action = ProgressAction(
+                label=label,
+                text=normalized,
+                status=status,
+                item_id=item_id,
+                subagent_label=subagent_label,
+            )
+            # Force the next output delta to create a fresh trailing output slot.
+            self.last_output_index = None
+            self.step += 1
+            return
+        self.clear_transient_action()
+        if label != "output":
+            self.last_output_index = None
         self.actions.append(
             ProgressAction(
                 label=label,
@@ -88,14 +126,8 @@ class TurnProgressTracker:
                 self.last_output_index -= removed
                 if self.last_output_index < 0:
                     self.last_output_index = None
-            if self.last_thinking_index is not None:
-                self.last_thinking_index -= removed
-                if self.last_thinking_index < 0:
-                    self.last_thinking_index = None
         if track_output:
             self.last_output_index = len(self.actions) - 1
-        if track_thinking:
-            self.last_thinking_index = len(self.actions) - 1
 
     def update_action(self, index: Optional[int], text: str, status: str) -> None:
         if index is None or index < 0 or index >= len(self.actions):
@@ -128,28 +160,41 @@ class TurnProgressTracker:
                 return True
         return False
 
-    def note_thinking(self, text: str) -> None:
-        if self.last_thinking_index is None:
-            self.add_action("thinking", text, "update", track_thinking=True)
-            return
-        self.update_action(self.last_thinking_index, text, "update")
+    def clear_transient_action(self) -> None:
+        self.transient_action = None
 
-    def note_output(self, text: str) -> None:
-        normalized = _truncate_text(_normalize_text(text), self.max_output_chars)
+    def note_thinking(self, text: str) -> None:
+        normalized = _normalize_text(text)
         if not normalized:
             return
+        self.add_action("thinking", normalized, "update")
+
+    def note_output(self, text: str) -> None:
+        normalized_piece = _normalize_text(text)
+        if not normalized_piece:
+            return
+        self.clear_transient_action()
+        self.output_buffer = _truncate_tail(
+            _merge_output_text(self.output_buffer, normalized_piece),
+            self.max_output_chars,
+        )
+        normalized = self.output_buffer
         if self.last_output_index is None:
             self.add_action("output", normalized, "update", track_output=True)
             return
         self.update_action(self.last_output_index, normalized, "update")
 
     def note_command(self, text: str) -> None:
-        self.add_action("command", text, "done")
-        self.last_output_index = None
+        normalized = _normalize_text(text)
+        if not normalized:
+            return
+        self.add_action("command", normalized, "done")
 
     def note_tool(self, text: str) -> None:
-        self.add_action("tool", text, "done")
-        self.last_output_index = None
+        normalized = _normalize_text(text)
+        if not normalized:
+            return
+        self.add_action("tool", normalized, "done")
 
     def note_file_change(self, text: str) -> None:
         self.add_action("files", text, "done")
@@ -173,32 +218,25 @@ def render_progress_text(
     if tracker.context_usage_percent is not None:
         parts.append(f"ctx {tracker.context_usage_percent}%")
     header = " · ".join(parts)
-    thinking_action = None
-    if tracker.last_thinking_index is not None:
-        if 0 <= tracker.last_thinking_index < len(tracker.actions):
-            thinking_action = tracker.actions[tracker.last_thinking_index]
     actions = tracker.actions[-tracker.max_actions :] if tracker.max_actions > 0 else []
-    if thinking_action is not None:
-        actions = [action for action in actions if action is not thinking_action]
-        actions.append(thinking_action)
-        if tracker.max_actions <= 0:
-            actions = [thinking_action]
-        elif len(actions) > tracker.max_actions:
+    if tracker.transient_action is not None:
+        actions = [*actions, tracker.transient_action]
+        if tracker.max_actions > 0 and len(actions) > tracker.max_actions:
             actions = actions[-tracker.max_actions :]
     blocks: list[list[str]] = []
     for action in actions:
         block: list[str]
-        if action is thinking_action:
-            block = [f"🧠 {action.text}"]
-            if blocks:
-                block.insert(0, "")
-        elif action.subagent_label and action.label == "thinking":
+        if action.label == "thinking" and action.subagent_label:
             block = [
                 "---",
                 f"🤖 {action.subagent_label} thinking",
                 action.text or "...",
                 "---",
             ]
+            if blocks:
+                block.insert(0, "")
+        elif action.label == "thinking":
+            block = [f"🧠 {action.text}"]
             if blocks:
                 block.insert(0, "")
         else:

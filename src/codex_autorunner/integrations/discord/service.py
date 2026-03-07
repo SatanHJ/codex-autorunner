@@ -188,7 +188,7 @@ DEFAULT_UPDATE_REPO_URL = "https://github.com/Git-on-my-level/codex-autorunner.g
 DEFAULT_UPDATE_REPO_REF = "main"
 DISCORD_TURN_PROGRESS_MIN_EDIT_INTERVAL_SECONDS = 1.0
 DISCORD_TURN_PROGRESS_HEARTBEAT_INTERVAL_SECONDS = 2.0
-DISCORD_TURN_PROGRESS_MAX_ACTIONS = 8
+DISCORD_TURN_PROGRESS_MAX_ACTIONS = 12
 DISCORD_TURN_PROGRESS_MAX_OUTPUT_CHARS = 120
 SHELL_OUTPUT_TRUNCATION_SUFFIX = "\n...[truncated]..."
 DISCORD_ATTACHMENT_MAX_BYTES = 100_000_000
@@ -1984,16 +1984,19 @@ class DiscordBotService:
                         )
                 elif isinstance(run_event, Completed):
                     final_message = run_event.final_message or final_message
+                    tracker.clear_transient_action()
                     tracker.set_label("done")
                     await _edit_progress(force=True, remove_components=True)
                 elif isinstance(run_event, Failed):
                     error_message = run_event.error_message or "Turn failed"
                     tracker.note_error(error_message)
+                    tracker.clear_transient_action()
                     tracker.set_label("failed")
                     await _edit_progress(force=True, remove_components=True)
         except Exception as exc:
             error_message = str(exc) or "Turn failed"
             tracker.note_error(error_message)
+            tracker.clear_transient_action()
             tracker.set_label("failed")
             await _edit_progress(force=True, remove_components=True)
             raise

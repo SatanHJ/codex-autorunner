@@ -4,12 +4,11 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import threading
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import IO, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
@@ -74,6 +73,29 @@ from ..schemas import (
     TicketUpdateRequest,
 )
 from ..services import flow_store as flow_store_service
+from .flow_routes import FlowRoutesState
+from .flow_routes.history_artifacts import (
+    get_diff_stats_by_dispatch_seq as extracted_get_diff_stats_by_dispatch_seq,
+)
+from .flow_routes.history_artifacts import (
+    get_dispatch_history_file as extracted_get_dispatch_history_file,
+)
+from .flow_routes.history_artifacts import (
+    get_reply_history as extracted_get_reply_history,
+)
+from .flow_routes.run_routes import (
+    archive_flow_run as extracted_archive_flow_run,
+)
+from .flow_routes.run_routes import (
+    get_flow_run_status as extracted_get_flow_run_status,
+)
+from .flow_routes.run_routes import (
+    resume_flow_run as extracted_resume_flow_run,
+)
+from .flow_routes.run_routes import (
+    stop_flow_worker as extracted_stop_flow_worker,
+)
+from .flow_routes.ticket_bootstrap import run_bootstrap as extracted_run_bootstrap
 
 _logger = logging.getLogger(__name__)
 
@@ -81,21 +103,17 @@ _supported_flow_types = ("ticket_flow",)
 _FLOW_DB_CORRUPT_SUFFIX = ".corrupt"
 _FLOW_DB_NOTICE_SUFFIX = ".corrupt.json"
 
-
-@dataclass
-class FlowRoutesState:
-    active_workers: Dict[
-        str, Tuple[Optional[subprocess.Popen], Optional[IO[bytes]], Optional[IO[bytes]]]
-    ]
-    controller_cache: Dict[tuple[Path, str], FlowController]
-    definition_cache: Dict[tuple[Path, str], FlowDefinition]
-    lock: threading.Lock
-
-    def __init__(self) -> None:
-        self.active_workers = {}
-        self.controller_cache = {}
-        self.definition_cache = {}
-        self.lock = threading.Lock()
+# Keep the staged extraction seams visible while this module remains the composition owner.
+_EXTRACTED_FLOW_ROUTE_SEAMS = (
+    extracted_get_diff_stats_by_dispatch_seq,
+    extracted_get_dispatch_history_file,
+    extracted_get_reply_history,
+    extracted_stop_flow_worker,
+    extracted_resume_flow_run,
+    extracted_archive_flow_run,
+    extracted_get_flow_run_status,
+    extracted_run_bootstrap,
+)
 
 
 def _utc_stamp() -> str:

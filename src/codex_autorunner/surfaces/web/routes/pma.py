@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
 import json
 import logging
 import re
@@ -91,10 +90,6 @@ from ....integrations.telegram.state import (
 )
 from ....manifest import load_manifest
 from ..schemas import (
-    PmaAutomationSubscriptionCreateRequest,
-    PmaAutomationTimerCancelRequest,
-    PmaAutomationTimerCreateRequest,
-    PmaAutomationTimerTouchRequest,
     PmaManagedThreadCompactRequest,
     PmaManagedThreadCreateRequest,
     PmaManagedThreadMessageRequest,
@@ -104,21 +99,60 @@ from ..services.pma.common import (
     build_idempotency_key as service_build_idempotency_key,
 )
 from ..services.pma.common import (
-    normalize_optional_text as service_normalize_optional_text,
-)
-from ..services.pma.common import (
     pma_config_from_raw,
 )
 from .agents import _available_agents, _serialize_model_catalog
+from .pma_routes import (
+    build_automation_routes,
+    build_chat_runtime_router,
+    build_history_files_docs_router,
+    build_managed_thread_crud_routes,
+    build_managed_thread_runtime_routes,
+    build_managed_thread_tail_routes,
+)
+from .pma_routes.automation_adapter import (
+    discover_automation_store_class as _discover_automation_store_class,
+)
+from .pma_routes.automation_adapter import (
+    first_callable as _first_callable,
+)
+from .pma_routes.automation_adapter import (
+    normalize_optional_text as _normalize_optional_text,
+)
+from .pma_routes.managed_threads import _truncate_text
+from .pma_routes.publish import (
+    PMA_PUBLISH_RETRY_DELAYS_SECONDS,
+)
+from .pma_routes.runtime_state import PmaRuntimeState
+from .pma_routes.tail_stream import (
+    coerce_dict as _coerce_dict,
+)
+from .pma_routes.tail_stream import (
+    iso_from_event_ms as _iso_from_event_ms,
+)
+from .pma_routes.tail_stream import (
+    normalize_tail_level as _normalize_tail_level,
+)
+from .pma_routes.tail_stream import (
+    parse_iso_datetime as _parse_iso_datetime,
+)
+from .pma_routes.tail_stream import (
+    resolve_resume_after as _resolve_resume_after,
+)
+from .pma_routes.tail_stream import (
+    since_ms_from_duration as since_ms_from_duration,
+)
 from .shared import SSE_HEADERS
 
 logger = logging.getLogger(__name__)
+
+_pma_runtime_state = PmaRuntimeState()
 
 PMA_TIMEOUT_SECONDS = 7200
 PMA_CONTEXT_SNAPSHOT_MAX_BYTES = 200_000
 PMA_CONTEXT_LOG_SOFT_LIMIT_BYTES = 5_000_000
 PMA_BULK_DELETE_SAMPLE_LIMIT = 10
-PMA_PUBLISH_RETRY_DELAYS_SECONDS = (0.0, 0.25, 0.75)
+# PMA_PUBLISH_RETRY_DELAYS_SECONDS imported from .pma_routes.publish
 PMA_DISCORD_MESSAGE_MAX_LEN = 1900
 MANAGED_THREAD_PUBLIC_EXECUTION_ERROR = "Managed thread execution failed"
 MANAGED_THREAD_PUBLIC_INTERRUPT_ERROR = "Failed to interrupt backend turn"
@@ -151,8 +185,60 @@ def build_pma_routes() -> APIRouter:
     lane_workers: dict[str, PmaLaneWorker] = {}
     item_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
-    def _normalize_optional_text(value: Any) -> Optional[str]:
-        return service_normalize_optional_text(value)
+    def _route_method_path_pairs(target_router: APIRouter) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for route in target_router.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None) or ()
+            if not isinstance(path, str):
+                continue
+            for method in methods:
+                if method in {"HEAD", "OPTIONS"}:
+                    continue
+                pairs.add((str(method), path))
+        return pairs
+
+    def _prune_overlapping_routes(
+        target_router: APIRouter, overlapping_pairs: set[tuple[str, str]]
+    ) -> None:
+        filtered_routes = []
+        for route in target_router.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None) or ()
+            if not isinstance(path, str):
+                filtered_routes.append(route)
+                continue
+            route_pairs = {
+                (str(method), path)
+                for method in methods
+                if method not in {"HEAD", "OPTIONS"}
+            }
+            if route_pairs and route_pairs.issubset(overlapping_pairs):
+                continue
+            filtered_routes.append(route)
+        target_router.routes = filtered_routes
+
+    def _dedupe_router_routes_keep_last(target_router: APIRouter) -> None:
+        filtered_routes_reversed = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for route in reversed(target_router.routes):
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None) or ()
+            if not isinstance(path, str):
+                filtered_routes_reversed.append(route)
+                continue
+            route_pairs = {
+                (str(method), path)
+                for method in methods
+                if method not in {"HEAD", "OPTIONS"}
+            }
+            if route_pairs and route_pairs.issubset(seen_pairs):
+                continue
+            seen_pairs.update(route_pairs)
+            filtered_routes_reversed.append(route)
+        target_router.routes = list(reversed(filtered_routes_reversed))
+
+    # _normalize_optional_text imported from automation_adapter.py
 
     def _get_pma_config(request: Request) -> dict[str, Any]:
         raw = getattr(request.app.state.config, "raw", {})
@@ -247,30 +333,8 @@ def build_pma_routes() -> APIRouter:
             raise last_type_error
         raise RuntimeError("No automation method call attempts were provided")
 
-    def _first_callable(target: Any, names: tuple[str, ...]) -> Optional[Any]:
-        for name in names:
-            candidate = getattr(target, name, None)
-            if callable(candidate):
-                return candidate
-        return None
-
-    def _discover_automation_store_class() -> Optional[type[Any]]:
-        candidates: tuple[tuple[str, str], ...] = (
-            ("codex_autorunner.core.pma_automation_store", "PmaAutomationStore"),
-            ("codex_autorunner.core.pma_automation", "PmaAutomationStore"),
-            ("codex_autorunner.core.automation_store", "AutomationStore"),
-            ("codex_autorunner.core.automation", "AutomationStore"),
-            ("codex_autorunner.core.hub_automation", "HubAutomationStore"),
-        )
-        for module_name, class_name in candidates:
-            try:
-                module = importlib.import_module(module_name)
-            except Exception:
-                continue
-            klass = getattr(module, class_name, None)
-            if isinstance(klass, type):
-                return klass
-        return None
+    # _first_callable imported from automation_adapter.py
+    # _discover_automation_store_class imported from automation_adapter.py
 
     async def _call_store_create_with_payload(
         store: Any, method_names: tuple[str, ...], payload: dict[str, Any]
@@ -612,99 +676,14 @@ def build_pma_routes() -> APIRouter:
             return created
         return {"subscription": created}
 
-    def _coerce_dict(value: Any) -> dict[str, Any]:
-        return value if isinstance(value, dict) else {}
+    # _coerce_dict imported from tail_stream.py
+    # _parse_iso_datetime imported from tail_stream.py
+    # _parse_tail_duration_seconds imported from tail_stream.py
+    # since_ms_from_duration imported from tail_stream.py
 
-    def _parse_iso_datetime(value: Any) -> Optional[datetime]:
-        if not isinstance(value, str) or not value.strip():
-            return None
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-
-    def _parse_tail_duration_seconds(value: Optional[str]) -> Optional[int]:
-        if value is None:
-            return None
-        raw = value.strip().lower()
-        if not raw:
-            raise HTTPException(status_code=400, detail="since must not be empty")
-        multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-        total_seconds = 0
-        idx = 0
-        size = len(raw)
-        while idx < size:
-            start = idx
-            while idx < size and raw[idx].isdigit():
-                idx += 1
-            if start == idx or idx >= size:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Invalid since duration. Use forms like 30s, 5m, 2h, 1d, "
-                        "or combined 1h30m."
-                    ),
-                )
-            amount_text = raw[start:idx]
-            # Keep duration parsing bounded and predictable.
-            if len(amount_text) > 9:
-                raise HTTPException(
-                    status_code=400, detail="since duration component is too large"
-                )
-            unit = raw[idx]
-            multiplier = multipliers.get(unit)
-            if multiplier is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Invalid since duration. Use forms like 30s, 5m, 2h, 1d, "
-                        "or combined 1h30m."
-                    ),
-                )
-            idx += 1
-            total_seconds += int(amount_text) * multiplier
-        if total_seconds <= 0:
-            raise HTTPException(status_code=400, detail="since must be > 0")
-        return total_seconds
-
-    def _since_ms_from_duration(value: Optional[str]) -> Optional[int]:
-        seconds = _parse_tail_duration_seconds(value)
-        if seconds is None:
-            return None
-        return int((datetime.now(timezone.utc).timestamp() - seconds) * 1000)
-
-    def _normalize_tail_level(level: Optional[str]) -> str:
-        normalized = (level or "info").strip().lower() or "info"
-        if normalized not in {"info", "debug"}:
-            raise HTTPException(status_code=400, detail="level must be info or debug")
-        return normalized
-
-    def _resolve_resume_after(
-        request: Request, since_event_id: Optional[int]
-    ) -> Optional[int]:
-        if since_event_id is not None:
-            if since_event_id < 0:
-                raise HTTPException(
-                    status_code=400, detail="since_event_id must be >= 0"
-                )
-            return since_event_id
-        last_event_id = request.headers.get("Last-Event-ID")
-        if not last_event_id:
-            return None
-        try:
-            parsed = int(last_event_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail="Invalid Last-Event-ID header"
-            ) from exc
-        if parsed < 0:
-            raise HTTPException(status_code=400, detail="Last-Event-ID must be >= 0")
-        return parsed
-
-    def _iso_from_event_ms(value: Any) -> Optional[str]:
-        if not isinstance(value, (int, float)) or value <= 0:
-            return None
-        return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc).isoformat()
+    # _normalize_tail_level imported from tail_stream.py
+    # _resolve_resume_after imported from tail_stream.py
+    # _iso_from_event_ms imported from tail_stream.py
 
     def _redact_nested(value: Any) -> Any:
         if isinstance(value, str):
@@ -1302,14 +1281,7 @@ def build_pma_routes() -> APIRouter:
         task.add_done_callback(_on_done)
         task.cancel()
 
-    def _truncate_text(value: Any, limit: int) -> str:
-        if not isinstance(value, str):
-            text_value: str = "" if value is None else str(value)
-        else:
-            text_value = value
-        if len(text_value) <= limit:
-            return text_value
-        return text_value[: max(0, limit - 3)] + "..."
+    # _truncate_text imported from managed_threads.py
 
     def _format_last_result(
         result: dict[str, Any], current: dict[str, Any]
@@ -2079,213 +2051,6 @@ def build_pma_routes() -> APIRouter:
             raise HTTPException(status_code=404, detail="Managed thread not found")
         return {"thread": thread}
 
-    @router.post("/automation/subscriptions")
-    @router.post("/subscriptions")
-    async def create_automation_subscription(
-        request: Request, payload: PmaAutomationSubscriptionCreateRequest
-    ) -> dict[str, Any]:
-        store = await _get_automation_store(request)
-        created = await _call_store_create_with_payload(
-            store,
-            (
-                "create_subscription",
-                "add_subscription",
-                "upsert_subscription",
-            ),
-            payload.model_dump(exclude_none=True),
-        )
-        if isinstance(created, dict) and "subscription" in created:
-            return created
-        return {"subscription": created}
-
-    @router.get("/automation/subscriptions")
-    @router.get("/subscriptions")
-    async def list_automation_subscriptions(
-        request: Request,
-        repo_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        thread_id: Optional[str] = None,
-        lane_id: Optional[str] = None,
-        limit: int = 200,
-    ) -> dict[str, Any]:
-        if limit <= 0:
-            raise HTTPException(status_code=400, detail="limit must be greater than 0")
-        store = await _get_automation_store(request)
-        filters = {
-            "repo_id": _normalize_optional_text(repo_id),
-            "run_id": _normalize_optional_text(run_id),
-            "thread_id": _normalize_optional_text(thread_id),
-            "lane_id": _normalize_optional_text(lane_id),
-            "limit": limit,
-        }
-        subscriptions = await _call_store_list(
-            store,
-            (
-                "list_subscriptions",
-                "get_subscriptions",
-            ),
-            {k: v for k, v in filters.items() if v is not None},
-        )
-        if isinstance(subscriptions, dict) and "subscriptions" in subscriptions:
-            return subscriptions
-        if subscriptions is None:
-            subscriptions = []
-        return {"subscriptions": list(subscriptions)}
-
-    @router.delete("/automation/subscriptions/{subscription_id}")
-    @router.delete("/subscriptions/{subscription_id}")
-    async def delete_automation_subscription(
-        subscription_id: str, request: Request
-    ) -> dict[str, Any]:
-        normalized_id = (subscription_id or "").strip()
-        if not normalized_id:
-            raise HTTPException(status_code=400, detail="subscription_id is required")
-        store = await _get_automation_store(request)
-        deleted = await _call_store_action_with_id(
-            store,
-            (
-                "delete_subscription",
-                "remove_subscription",
-                "cancel_subscription",
-            ),
-            normalized_id,
-            payload={},
-            id_aliases=("subscription_id", "id"),
-        )
-        if isinstance(deleted, dict):
-            payload = dict(deleted)
-            payload.setdefault("status", "ok")
-            payload.setdefault("subscription_id", normalized_id)
-            return payload
-        return {
-            "status": "ok",
-            "subscription_id": normalized_id,
-            "deleted": True if deleted is None else bool(deleted),
-        }
-
-    @router.post("/automation/timers")
-    @router.post("/timers")
-    async def create_automation_timer(
-        request: Request, payload: PmaAutomationTimerCreateRequest
-    ) -> dict[str, Any]:
-        store = await _get_automation_store(request)
-        created = await _call_store_create_with_payload(
-            store,
-            (
-                "create_timer",
-                "add_timer",
-                "upsert_timer",
-            ),
-            payload.model_dump(exclude_none=True),
-        )
-        if isinstance(created, dict) and "timer" in created:
-            return created
-        return {"timer": created}
-
-    @router.get("/automation/timers")
-    @router.get("/timers")
-    async def list_automation_timers(
-        request: Request,
-        timer_type: Optional[str] = None,
-        subscription_id: Optional[str] = None,
-        repo_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        thread_id: Optional[str] = None,
-        lane_id: Optional[str] = None,
-        limit: int = 200,
-    ) -> dict[str, Any]:
-        if limit <= 0:
-            raise HTTPException(status_code=400, detail="limit must be greater than 0")
-        store = await _get_automation_store(request)
-        filters = {
-            "timer_type": _normalize_optional_text(timer_type),
-            "subscription_id": _normalize_optional_text(subscription_id),
-            "repo_id": _normalize_optional_text(repo_id),
-            "run_id": _normalize_optional_text(run_id),
-            "thread_id": _normalize_optional_text(thread_id),
-            "lane_id": _normalize_optional_text(lane_id),
-            "limit": limit,
-        }
-        timers = await _call_store_list(
-            store,
-            (
-                "list_timers",
-                "get_timers",
-            ),
-            {k: v for k, v in filters.items() if v is not None},
-        )
-        if isinstance(timers, dict) and "timers" in timers:
-            return timers
-        if timers is None:
-            timers = []
-        return {"timers": list(timers)}
-
-    @router.post("/automation/timers/{timer_id}/touch")
-    @router.post("/timers/{timer_id}/touch")
-    async def touch_automation_timer(
-        timer_id: str,
-        request: Request,
-        payload: Optional[PmaAutomationTimerTouchRequest] = None,
-    ) -> dict[str, Any]:
-        normalized_id = (timer_id or "").strip()
-        if not normalized_id:
-            raise HTTPException(status_code=400, detail="timer_id is required")
-        store = await _get_automation_store(request)
-        resolved_payload = (
-            payload.model_dump(exclude_none=True) if payload is not None else {}
-        )
-        touched = await _call_store_action_with_id(
-            store,
-            (
-                "touch_timer",
-                "refresh_timer",
-                "renew_timer",
-            ),
-            normalized_id,
-            payload=resolved_payload,
-            id_aliases=("timer_id", "id"),
-        )
-        if isinstance(touched, dict):
-            out = dict(touched)
-            out.setdefault("status", "ok")
-            out.setdefault("timer_id", normalized_id)
-            return out
-        return {"status": "ok", "timer_id": normalized_id}
-
-    @router.post("/automation/timers/{timer_id}/cancel")
-    @router.post("/timers/{timer_id}/cancel")
-    @router.delete("/automation/timers/{timer_id}")
-    @router.delete("/timers/{timer_id}")
-    async def cancel_automation_timer(
-        timer_id: str,
-        request: Request,
-        payload: Optional[PmaAutomationTimerCancelRequest] = None,
-    ) -> dict[str, Any]:
-        normalized_id = (timer_id or "").strip()
-        if not normalized_id:
-            raise HTTPException(status_code=400, detail="timer_id is required")
-        store = await _get_automation_store(request)
-        resolved_payload = (
-            payload.model_dump(exclude_none=True) if payload is not None else {}
-        )
-        cancelled = await _call_store_action_with_id(
-            store,
-            (
-                "cancel_timer",
-                "delete_timer",
-                "remove_timer",
-            ),
-            normalized_id,
-            payload=resolved_payload,
-            id_aliases=("timer_id", "id"),
-        )
-        if isinstance(cancelled, dict):
-            out = dict(cancelled)
-            out.setdefault("status", "ok")
-            out.setdefault("timer_id", normalized_id)
-            return out
-        return {"status": "ok", "timer_id": normalized_id}
-
     @router.post("/threads/{managed_thread_id}/compact")
     def compact_managed_thread(
         managed_thread_id: str,
@@ -2397,55 +2162,6 @@ def build_pma_routes() -> APIRouter:
         if updated is None:
             raise HTTPException(status_code=404, detail="Managed thread not found")
         return {"thread": updated}
-
-    @router.get("/threads/{managed_thread_id}/turns")
-    def list_managed_thread_turns(
-        managed_thread_id: str,
-        request: Request,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        if limit <= 0:
-            raise HTTPException(status_code=400, detail="limit must be greater than 0")
-        limit = min(limit, 200)
-
-        store = PmaThreadStore(request.app.state.config.root)
-        thread = store.get_thread(managed_thread_id)
-        if thread is None:
-            raise HTTPException(status_code=404, detail="Managed thread not found")
-
-        turns = store.list_turns(managed_thread_id, limit=limit)
-        return {
-            "turns": [
-                {
-                    "managed_turn_id": turn.get("managed_turn_id"),
-                    "status": turn.get("status"),
-                    "prompt_preview": _truncate_text(turn.get("prompt") or "", 120),
-                    "assistant_preview": _truncate_text(
-                        turn.get("assistant_text") or "", 120
-                    ),
-                    "started_at": turn.get("started_at"),
-                    "finished_at": turn.get("finished_at"),
-                    "error": turn.get("error"),
-                }
-                for turn in turns
-            ]
-        }
-
-    @router.get("/threads/{managed_thread_id}/turns/{managed_turn_id}")
-    def get_managed_thread_turn(
-        managed_thread_id: str,
-        managed_turn_id: str,
-        request: Request,
-    ) -> dict[str, Any]:
-        store = PmaThreadStore(request.app.state.config.root)
-        thread = store.get_thread(managed_thread_id)
-        if thread is None:
-            raise HTTPException(status_code=404, detail="Managed thread not found")
-
-        turn = store.get_turn(managed_thread_id, managed_turn_id)
-        if turn is None:
-            raise HTTPException(status_code=404, detail="Managed turn not found")
-        return {"turn": turn}
 
     async def _build_managed_thread_tail_snapshot(
         *,
@@ -2592,7 +2308,7 @@ def build_pma_routes() -> APIRouter:
         normalized_limit = min(limit, 200)
         normalized_level = _normalize_tail_level(level)
         resume_after = _resolve_resume_after(request, since_event_id)
-        since_ms = _since_ms_from_duration(since)
+        since_ms = since_ms_from_duration(since)
         snapshot = await _build_managed_thread_tail_snapshot(
             request=request,
             managed_thread_id=managed_thread_id,
@@ -2654,7 +2370,7 @@ def build_pma_routes() -> APIRouter:
         normalized_limit = min(limit, 200)
         normalized_level = _normalize_tail_level(level)
         resume_after = _resolve_resume_after(request, since_event_id)
-        since_ms = _since_ms_from_duration(since)
+        since_ms = since_ms_from_duration(since)
         return await _build_managed_thread_tail_snapshot(
             request=request,
             managed_thread_id=managed_thread_id,
@@ -2678,7 +2394,7 @@ def build_pma_routes() -> APIRouter:
         normalized_limit = min(limit, 200)
         normalized_level = _normalize_tail_level(level)
         resume_after = _resolve_resume_after(request, since_event_id)
-        since_ms = _since_ms_from_duration(since)
+        since_ms = since_ms_from_duration(since)
         snapshot = await _build_managed_thread_tail_snapshot(
             request=request,
             managed_thread_id=managed_thread_id,
@@ -4468,6 +4184,24 @@ def build_pma_routes() -> APIRouter:
     router._pma_start_lane_worker = _ensure_lane_worker_for_app  # type: ignore[attr-defined]
     router._pma_stop_lane_worker = _stop_lane_worker_for_app  # type: ignore[attr-defined]
     router._pma_stop_all_lane_workers = _stop_all_lane_workers_for_app  # type: ignore[attr-defined]
+
+    def _get_runtime_state():
+        return _pma_runtime_state
+
+    extracted_router = APIRouter(
+        prefix=router.prefix,
+        dependencies=router.dependencies,
+    )
+    build_automation_routes(extracted_router, _get_runtime_state)
+    build_managed_thread_crud_routes(extracted_router, _get_runtime_state)
+    build_managed_thread_tail_routes(extracted_router, _get_runtime_state)
+    build_managed_thread_runtime_routes(extracted_router, _get_runtime_state)
+    build_history_files_docs_router(extracted_router, _get_runtime_state)
+    build_chat_runtime_router(extracted_router, _get_runtime_state)
+    _dedupe_router_routes_keep_last(extracted_router)
+    _prune_overlapping_routes(extracted_router, _route_method_path_pairs(router))
+    router.routes.extend(extracted_router.routes)
+
     return router
 
 

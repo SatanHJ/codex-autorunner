@@ -1,0 +1,39 @@
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+from . import (
+    definitions,
+    history_artifacts,
+    run_routes,
+    runtime_service,
+    ticket_bootstrap,
+)
+
+__all__ = [
+    "FlowRoutesState",
+    "definitions",
+    "history_artifacts",
+    "runtime_service",
+    "run_routes",
+    "ticket_bootstrap",
+]
+
+
+@dataclass
+class FlowRoutesState:
+    active_workers: Dict[
+        str, Tuple[Optional[object], Optional[object], Optional[object]]
+    ]
+    controller_cache: Dict[tuple[Path, str], object]
+    definition_cache: Dict[tuple[Path, str], object]
+    lock: threading.Lock
+
+    def __init__(self) -> None:
+        self.active_workers = {}
+        self.controller_cache = {}
+        self.definition_cache = {}
+        self.lock = threading.Lock()

@@ -150,17 +150,19 @@ from ...tickets.files import (
 )
 from ...tickets.outbox import resolve_outbox_paths
 from ...voice import VoiceConfig, VoiceService, VoiceServiceError
-from ..telegram.constants import DEFAULT_SKILLS_LIST_LIMIT
-from ..telegram.helpers import (
+from ..chat.progress_primitives import TurnProgressTracker, render_progress_text
+from ..chat.review_commits import _parse_review_commit_log
+from ..chat.thread_summaries import (
     _coerce_thread_list,
-    _extract_context_usage_percent,
     _extract_thread_list_cursor,
     _extract_thread_preview_parts,
-    _format_skills_list,
-    _format_turn_metrics,
-    _parse_review_commit_log,
 )
-from ..telegram.progress_stream import TurnProgressTracker, render_progress_text
+from ..chat.turn_metrics import (
+    _extract_context_usage_percent,
+    _format_turn_metrics,
+)
+from ..telegram.constants import DEFAULT_SKILLS_LIST_LIMIT
+from ..telegram.helpers import _format_skills_list
 from .adapter import DiscordChatAdapter
 from .allowlist import DiscordAllowlist, allowlist_allows
 from .command_registry import sync_commands
@@ -1207,8 +1209,7 @@ class DiscordBotService:
                 channel_id,
                 {
                     "content": (
-                        f"Turn failed: {exc} "
-                        f"(conversation {context.conversation_id})"
+                        f"Turn failed: {exc} (conversation {context.conversation_id})"
                     )
                 },
             )
@@ -1452,15 +1453,16 @@ class DiscordBotService:
                     mime_type if isinstance(mime_type, str) else None,
                     str(original_name),
                 )
-                transcript_text, transcript_warning = (
-                    await self._transcribe_voice_attachment(
-                        workspace_root=workspace_root,
-                        channel_id=channel_id,
-                        attachment=attachment,
-                        data=data,
-                        file_name=transcription_name,
-                        mime_type=mime_type if isinstance(mime_type, str) else None,
-                    )
+                (
+                    transcript_text,
+                    transcript_warning,
+                ) = await self._transcribe_voice_attachment(
+                    workspace_root=workspace_root,
+                    channel_id=channel_id,
+                    attachment=attachment,
+                    data=data,
+                    file_name=transcription_name,
+                    mime_type=mime_type if isinstance(mime_type, str) else None,
                 )
                 saved.append(
                     _SavedDiscordAttachment(

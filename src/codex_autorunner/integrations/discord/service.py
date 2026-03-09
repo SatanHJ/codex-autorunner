@@ -327,13 +327,13 @@ def _is_valid_opencode_model_name(model_name: str) -> bool:
     return bool(provider_id.strip() and model_id.strip())
 
 
-def _path_within(root: Path, target: Path) -> bool:
+def _path_within(*, root: Path, target: Path) -> bool:
     try:
         root = canonicalize_path(root)
         target = canonicalize_path(target)
     except Exception:
         return False
-    return is_within(root, target)
+    return is_within(root=root, target=target)
 
 
 async def _model_list_with_agent_compat(
@@ -1652,7 +1652,9 @@ class DiscordBotService:
         if not isinstance(current_ticket, str) or not current_ticket.strip():
             return False
         ticket_path = (workspace_root / current_ticket).resolve()
-        if not ticket_path.is_file() or not is_within(workspace_root, ticket_path):
+        if not ticket_path.is_file() or not is_within(
+            root=workspace_root, target=ticket_path
+        ):
             return False
         ticket_doc, errors = read_ticket(ticket_path)
         if errors or ticket_doc is None:
@@ -8058,7 +8060,7 @@ class DiscordBotService:
 
         sent_dir = outbox_sent_dir(workspace_root)
         for source_dir, path in files:
-            if not _path_within(source_dir, path):
+            if not _path_within(root=source_dir, target=path):
                 log_event(
                     self._logger,
                     logging.WARNING,

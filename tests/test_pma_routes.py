@@ -154,6 +154,27 @@ def test_build_pma_routes_does_not_construct_async_primitives_on_route_build(
     pma_routes.build_pma_routes()
 
 
+def test_build_pma_routes_registers_unique_method_path_pairs() -> None:
+    router = pma_routes.build_pma_routes()
+    seen: set[tuple[str, str]] = set()
+    duplicates: set[tuple[str, str]] = set()
+
+    for route in router.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None) or ()
+        if not isinstance(path, str):
+            continue
+        for method in methods:
+            if method in {"HEAD", "OPTIONS"}:
+                continue
+            pair = (str(method), path)
+            if pair in seen:
+                duplicates.add(pair)
+            seen.add(pair)
+
+    assert duplicates == set()
+
+
 @pytest.mark.parametrize(
     ("method", "endpoint", "body"),
     [
@@ -344,8 +365,6 @@ def test_pma_chat_github_injection_uses_raw_user_message(
     hub_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _enable_pma(hub_env.hub_root)
-
-    app = create_hub_app(hub_env.hub_root)
     observed: dict[str, str] = {}
 
     async def _fake_github_context_injection(**kwargs):
@@ -354,8 +373,10 @@ def test_pma_chat_github_injection_uses_raw_user_message(
         return f"{prompt_text}\n\n[injected-from-github]", True
 
     monkeypatch.setattr(
-        pma_routes, "maybe_inject_github_context", _fake_github_context_injection
+        "codex_autorunner.surfaces.web.routes.pma.maybe_inject_github_context",
+        _fake_github_context_injection,
     )
+    app = create_hub_app(hub_env.hub_root)
 
     class FakeTurnHandle:
         def __init__(self) -> None:
@@ -1105,12 +1126,15 @@ async def test_pma_wakeup_publish_retries_transient_telegram_enqueue_failure(
 
 def test_pma_active_clears_on_prompt_build_error(hub_env, monkeypatch) -> None:
     _enable_pma(hub_env.hub_root)
-    app = create_hub_app(hub_env.hub_root)
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("snapshot failed")
 
-    monkeypatch.setattr(pma_routes, "build_hub_snapshot", _boom)
+    monkeypatch.setattr(
+        "codex_autorunner.surfaces.web.routes.pma.build_hub_snapshot",
+        _boom,
+    )
+    app = create_hub_app(hub_env.hub_root)
 
     client = TestClient(app)
     resp = client.post("/hub/pma/chat", json={"message": "hi"})

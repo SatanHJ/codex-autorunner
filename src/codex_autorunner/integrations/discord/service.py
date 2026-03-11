@@ -6048,6 +6048,13 @@ class DiscordBotService:
         store.initialize()
         return store
 
+    def _delete_flow_run_record(self, workspace_root: Path, run_id: str) -> bool:
+        store = self._open_flow_store(workspace_root)
+        try:
+            return bool(store.delete_flow_run(run_id))
+        finally:
+            store.close()
+
     def _resolve_flow_run_by_id(
         self,
         store: FlowStore,
@@ -7120,11 +7127,6 @@ class DiscordBotService:
             f"runs_archived={summary['archived_runs']}, "
             f"contextspace={summary['archived_contextspace']})."
         )
-        await self._respond_ephemeral(
-            interaction_id,
-            interaction_token,
-            outbound_text,
-        )
         run_mirror.mirror_outbound(
             run_id=target.id,
             platform="discord",
@@ -7139,6 +7141,12 @@ class DiscordBotService:
                 "archived_tickets": summary.get("archived_tickets"),
                 "archived_contextspace": summary.get("archived_contextspace"),
             },
+        )
+        self._delete_flow_run_record(workspace_root, target.id)
+        await self._respond_ephemeral(
+            interaction_id,
+            interaction_token,
+            outbound_text,
         )
 
     async def _handle_flow_reply(
@@ -8822,7 +8830,7 @@ class DiscordBotService:
                     workspace_root,
                     run_id=run_id,
                     force=False,
-                    delete_run=False,
+                    delete_run=True,
                 )
             except ValueError as exc:
                 await self._respond_ephemeral(

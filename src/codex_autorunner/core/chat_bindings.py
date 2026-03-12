@@ -4,6 +4,7 @@ import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -56,6 +57,13 @@ def _resolve_state_path(
     if not state_path.is_absolute():
         state_path = (hub_root / state_path).resolve()
     return state_path
+
+
+def _chat_surface_enabled(raw_config: Mapping[str, Any], section: str) -> bool:
+    section_cfg = raw_config.get(section)
+    if not isinstance(section_cfg, Mapping):
+        return False
+    return section_cfg.get("enabled") is True
 
 
 def _resolve_manifest_path(hub_root: Path, raw_config: Mapping[str, Any]) -> Path:
@@ -126,6 +134,15 @@ def _resolve_workspace_path(value: Any) -> str | None:
     return None
 
 
+def _normalize_workspace_path(value: Any) -> str | None:
+    if isinstance(value, Path):
+        try:
+            return str(value.resolve())
+        except Exception:
+            return str(value)
+    return _resolve_workspace_path(value)
+
+
 def _resolve_bound_repo_id(
     *,
     repo_id: Any,
@@ -163,6 +180,19 @@ def _normalize_scope(value: Any) -> str | None:
         return None
     scope = value.strip()
     return scope or None
+
+
+def _parse_iso_timestamp(raw: Any) -> float:
+    if not isinstance(raw, str):
+        return float("-inf")
+    value = raw.strip()
+    if not value:
+        return float("-inf")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return float("-inf")
 
 
 def _normalize_chat_identity(
@@ -289,6 +319,86 @@ def _read_discord_repo_counts(
             continue
         counts[repo_id] += 1
     return dict(counts)
+
+
+def _latest_discord_binding_timestamps_by_workspace(db_path: Path) -> dict[str, float]:
+    if not db_path.exists():
+        return {}
+    try:
+        with open_sqlite(db_path) as conn:
+            columns = _table_columns(conn, "channel_bindings")
+            if (
+                not columns
+                or "workspace_path" not in columns
+                or "updated_at" not in columns
+            ):
+                return {}
+            rows = conn.execute(
+                """
+                SELECT workspace_path, updated_at
+                  FROM channel_bindings
+                """
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise RuntimeError(
+            f"Failed reading Discord chat bindings from {db_path}: {exc}"
+        ) from exc
+
+    latest_by_workspace: dict[str, float] = {}
+    for row in rows:
+        workspace_path = _normalize_workspace_path(row["workspace_path"])
+        if workspace_path is None:
+            continue
+        timestamp = _parse_iso_timestamp(row["updated_at"])
+        previous = latest_by_workspace.get(workspace_path, float("-inf"))
+        if timestamp > previous:
+            latest_by_workspace[workspace_path] = timestamp
+    return latest_by_workspace
+
+
+def _latest_current_telegram_binding_timestamps_by_workspace(
+    db_path: Path,
+) -> dict[str, float]:
+    if not db_path.exists():
+        return {}
+    try:
+        with open_sqlite(db_path) as conn:
+            columns = _table_columns(conn, "telegram_topics")
+            if not columns or "workspace_path" not in columns:
+                return {}
+            select_columns = ["chat_id", "thread_id", "scope", "workspace_path"]
+            if "last_active_at" in columns:
+                select_columns.append("last_active_at")
+            if "updated_at" in columns:
+                select_columns.append("updated_at")
+            rows = conn.execute(
+                f"SELECT {', '.join(select_columns)} FROM telegram_topics"
+            ).fetchall()
+            scope_map = _read_telegram_current_scope_map(conn)
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise RuntimeError(
+            f"Failed reading Telegram chat bindings from {db_path}: {exc}"
+        ) from exc
+
+    latest_by_workspace: dict[str, float] = {}
+    for row in rows:
+        if not _is_current_telegram_topic_row(row=row, scope_map=scope_map):
+            continue
+        workspace_path = _normalize_workspace_path(row["workspace_path"])
+        if workspace_path is None:
+            continue
+        timestamp = max(
+            _parse_iso_timestamp(row["last_active_at"]),
+            _parse_iso_timestamp(row["updated_at"]),
+        )
+        previous = latest_by_workspace.get(workspace_path, float("-inf"))
+        if timestamp > previous:
+            latest_by_workspace[workspace_path] = timestamp
+    return latest_by_workspace
 
 
 def _active_pma_thread_counts(
@@ -445,9 +555,59 @@ def repo_has_active_non_pma_chat_binding(
     )
 
 
+def preferred_non_pma_chat_notification_source_for_workspace(
+    *, hub_root: Path, raw_config: Mapping[str, Any], workspace_root: Path
+) -> str | None:
+    """Return the preferred bound chat surface for workspace notifications."""
+
+    workspace_key = _normalize_workspace_path(workspace_root)
+    if workspace_key is None:
+        return None
+    return preferred_non_pma_chat_notification_sources_by_workspace(
+        hub_root=hub_root,
+        raw_config=raw_config,
+    ).get(workspace_key)
+
+
+def preferred_non_pma_chat_notification_sources_by_workspace(
+    *, hub_root: Path, raw_config: Mapping[str, Any]
+) -> dict[str, str]:
+    """Return preferred non-PMA notification surfaces keyed by workspace path."""
+
+    discord_timestamps: dict[str, float] = {}
+    if _chat_surface_enabled(raw_config, "discord_bot"):
+        discord_timestamps = _latest_discord_binding_timestamps_by_workspace(
+            _resolve_discord_state_path(hub_root, raw_config)
+        )
+    telegram_timestamps: dict[str, float] = {}
+    if _chat_surface_enabled(raw_config, "telegram_bot"):
+        telegram_timestamps = _latest_current_telegram_binding_timestamps_by_workspace(
+            _resolve_telegram_state_path(hub_root, raw_config)
+        )
+
+    preferred_by_workspace: dict[str, str] = {}
+    workspace_paths = set(discord_timestamps) | set(telegram_timestamps)
+    for workspace_path in workspace_paths:
+        discord_timestamp = discord_timestamps.get(workspace_path, float("-inf"))
+        telegram_timestamp = telegram_timestamps.get(workspace_path, float("-inf"))
+        candidates = [
+            ("discord", discord_timestamp),
+            ("telegram", telegram_timestamp),
+        ]
+        available = [item for item in candidates if item[1] != float("-inf")]
+        if not available:
+            continue
+        # Prefer the freshest persisted binding signal; ties fall back to Telegram.
+        available.sort(key=lambda item: (item[1], 1 if item[0] == "telegram" else 0))
+        preferred_by_workspace[workspace_path] = available[-1][0]
+    return preferred_by_workspace
+
+
 __all__ = [
     "active_chat_binding_counts",
     "active_chat_binding_counts_by_source",
+    "preferred_non_pma_chat_notification_source_for_workspace",
+    "preferred_non_pma_chat_notification_sources_by_workspace",
     "repo_has_active_chat_binding",
     "repo_has_active_non_pma_chat_binding",
 ]

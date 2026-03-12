@@ -4,9 +4,13 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
-from ...core.config import ConfigError, load_repo_config
+from ...core.chat_bindings import (
+    preferred_non_pma_chat_notification_source_for_workspace,
+    preferred_non_pma_chat_notification_sources_by_workspace,
+)
+from ...core.config import ConfigError, load_hub_config, load_repo_config
 from ...core.flows import FlowStore
 from ...core.flows.models import FlowRunRecord, FlowRunStatus
 from ...core.flows.pause_dispatch import load_latest_paused_ticket_flow_dispatch
@@ -41,6 +45,7 @@ class TelegramTicketFlowBridge:
         manifest_path: Optional[Path] = None,
         config_root: Optional[Path] = None,
         runtime_services: Optional[RuntimeServices] = None,
+        hub_raw_config: Optional[dict[str, Any]] = None,
     ) -> None:
         self._logger = logger
         self._store = store
@@ -53,6 +58,7 @@ class TelegramTicketFlowBridge:
         self._manifest_path = manifest_path
         self._config_root = config_root
         self._runtime_services = runtime_services
+        self._hub_raw_config = hub_raw_config
         self._last_default_notification: dict[Path, str] = {}
 
     @staticmethod
@@ -111,18 +117,28 @@ class TelegramTicketFlowBridge:
             return
         topics = await self._store.list_topics()
         workspace_topics = self._get_all_workspaces(topics or {})
+        preferred_sources = self._preferred_bound_sources_by_workspace()
 
         tasks = []
         for workspace_root, entries in workspace_topics.items():
             if entries:
                 tasks.append(
                     asyncio.create_task(
-                        self._notify_ticket_flow_pause(workspace_root, entries)
+                        self._notify_ticket_flow_pause(
+                            workspace_root,
+                            entries,
+                            preferred_source=preferred_sources.get(str(workspace_root)),
+                        )
                     )
                 )
             else:
                 tasks.append(
-                    asyncio.create_task(self._notify_via_default_chat(workspace_root))
+                    asyncio.create_task(
+                        self._notify_via_default_chat(
+                            workspace_root,
+                            preferred_source=preferred_sources.get(str(workspace_root)),
+                        )
+                    )
                 )
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -131,7 +147,15 @@ class TelegramTicketFlowBridge:
         self,
         workspace_root: Path,
         entries: list[tuple[str, object]],
+        *,
+        preferred_source: Optional[str] = None,
     ) -> None:
+        if preferred_source is None:
+            preferred_source = self._preferred_bound_source_for_workspace(
+                workspace_root
+            )
+        if preferred_source == "discord":
+            return
         try:
             pause = await asyncio.to_thread(
                 self._load_ticket_flow_pause, workspace_root
@@ -306,8 +330,19 @@ class TelegramTicketFlowBridge:
                 workspace_root=str(workspace_root),
             )
 
-    async def _notify_via_default_chat(self, workspace_root: Path) -> None:
+    async def _notify_via_default_chat(
+        self,
+        workspace_root: Path,
+        *,
+        preferred_source: Optional[str] = None,
+    ) -> None:
         if not self._pause_config.enabled or self._default_notification_chat_id is None:
+            return
+        if preferred_source is None:
+            preferred_source = self._preferred_bound_source_for_workspace(
+                workspace_root
+            )
+        if preferred_source in {"telegram", "discord"}:
             return
         try:
             pause = await asyncio.to_thread(
@@ -351,6 +386,56 @@ class TelegramTicketFlowBridge:
                 run_id=run_id,
                 seq=seq,
             )
+
+    def _preferred_bound_source_for_workspace(self, workspace_root: Path) -> str | None:
+        if self._hub_root is None:
+            return None
+        raw_config = self._hub_raw_config
+        if raw_config is None:
+            try:
+                raw_config = load_hub_config(self._hub_root).raw
+            except Exception:
+                raw_config = {}
+            self._hub_raw_config = raw_config
+        try:
+            return preferred_non_pma_chat_notification_source_for_workspace(
+                hub_root=self._hub_root,
+                raw_config=raw_config,
+                workspace_root=workspace_root,
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "telegram.ticket_flow.route_lookup_failed",
+                exc=exc,
+                workspace_root=str(workspace_root),
+            )
+            return None
+
+    def _preferred_bound_sources_by_workspace(self) -> dict[str, str]:
+        if self._hub_root is None:
+            return {}
+        raw_config = self._hub_raw_config
+        if raw_config is None:
+            try:
+                raw_config = load_hub_config(self._hub_root).raw
+            except Exception:
+                raw_config = {}
+            self._hub_raw_config = raw_config
+        try:
+            return preferred_non_pma_chat_notification_sources_by_workspace(
+                hub_root=self._hub_root,
+                raw_config=raw_config,
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "telegram.ticket_flow.route_lookup_failed",
+                exc=exc,
+            )
+            return {}
 
     async def _send_full_dispatch(
         self,

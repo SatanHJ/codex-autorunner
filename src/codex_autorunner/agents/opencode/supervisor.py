@@ -65,6 +65,7 @@ class OpenCodeHandle:
     workspace_root: Path
     process: Optional[asyncio.subprocess.Process]
     client: Optional[OpenCodeClient]
+    managed_process_record: Optional[ProcessRecord]
     base_url: Optional[str]
     health_info: Optional[dict[str, Any]]
     version: Optional[str]
@@ -77,9 +78,22 @@ class OpenCodeHandle:
 
 
 @dataclass(frozen=True)
+class OpenCodeHandleSnapshot:
+    workspace_id: str
+    workspace_root: str
+    mode: str
+    base_url: Optional[str]
+    process_pid: Optional[int]
+    managed_pid: Optional[int]
+    active_turns: int
+    started: bool
+
+
+@dataclass(frozen=True)
 class OpenCodeSupervisorSnapshot:
     cached_handles: int
     active_turns: int
+    handles: tuple[OpenCodeHandleSnapshot, ...] = ()
 
 
 class OpenCodeSupervisor:
@@ -137,7 +151,39 @@ class OpenCodeSupervisor:
                 active_turns=sum(
                     handle.active_turns for handle in self._handles.values()
                 ),
+                handles=tuple(
+                    self._handle_snapshot(handle) for handle in self._handles.values()
+                ),
             )
+
+    def observability_snapshot(self) -> dict[str, Any]:
+        handles = list(self._handles.values())
+        return {
+            "server_scope": self._server_scope,
+            "cached_handles": len(handles),
+            "active_turns": sum(handle.active_turns for handle in handles),
+            "handles": [
+                {
+                    "workspace_id": handle.workspace_id,
+                    "workspace_root": str(handle.workspace_root),
+                    "mode": self._handle_mode(handle),
+                    "base_url": handle.base_url,
+                    "process_pid": (
+                        handle.process.pid
+                        if handle.process is not None and handle.process.pid is not None
+                        else None
+                    ),
+                    "managed_pid": (
+                        handle.managed_process_record.pid
+                        if handle.managed_process_record is not None
+                        else None
+                    ),
+                    "active_turns": handle.active_turns,
+                    "started": handle.started,
+                }
+                for handle in handles
+            ],
+        }
 
     async def get_client(self, workspace_root: Path) -> OpenCodeClient:
         canonical_root = canonical_workspace_root(workspace_root)
@@ -156,17 +202,38 @@ class OpenCodeSupervisor:
         async with self._get_lock():
             handles = list(self._handles.values())
             self._handles = {}
+        log_event(
+            self._logger,
+            logging.INFO,
+            "opencode.supervisor.close_all",
+            handle_count=len(handles),
+            server_scope=self._server_scope,
+        )
         for handle in handles:
             await self._close_handle(handle, reason="close_all")
 
     async def prune_idle(self) -> int:
         handles = await self._pop_idle_handles()
         if not handles:
+            log_event(
+                self._logger,
+                logging.DEBUG,
+                "opencode.supervisor.prune_idle",
+                pruned_handles=0,
+                server_scope=self._server_scope,
+            )
             return 0
         closed = 0
         for handle in handles:
             await self._close_handle(handle, reason="idle_ttl")
             closed += 1
+        log_event(
+            self._logger,
+            logging.INFO,
+            "opencode.supervisor.prune_idle",
+            pruned_handles=closed,
+            server_scope=self._server_scope,
+        )
         return closed
 
     async def mark_turn_started(self, workspace_root: Path) -> None:
@@ -252,6 +319,13 @@ class OpenCodeSupervisor:
             returncode=(
                 handle.process.returncode if handle.process is not None else None
             ),
+            mode=self._handle_mode(handle),
+            managed_pid=(
+                handle.managed_process_record.pid
+                if handle.managed_process_record is not None
+                else None
+            ),
+            base_url=handle.base_url,
         )
 
         if self._server_scope == _SCOPE_GLOBAL and handle.client is not None:
@@ -271,14 +345,43 @@ class OpenCodeSupervisor:
             await handle.client.close()
 
         process = handle.process
-        if process is None or process.pid is None:
+        process_record: Optional[ProcessRecord] = None
+        if process is not None and process.pid is not None:
+            if process.returncode is not None:
+                self._delete_registry_record(
+                    handle,
+                    pid=process.pid,
+                    reason="process_already_exited",
+                )
+                handle.managed_process_record = None
+                return
+            process_record = self._build_record_for_handle(handle, process.pid)
+        else:
+            process_record = handle.managed_process_record
+            if process_record is None:
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "opencode.handle.close_skipped",
+                    workspace_id=handle.workspace_id,
+                    workspace_root=str(handle.workspace_root),
+                    reason="no_managed_process",
+                    mode=self._handle_mode(handle),
+                    base_url=handle.base_url,
+                )
+                return
+            if not self._record_is_running(process_record):
+                self._delete_registry_record(
+                    handle,
+                    pid=process_record.pid,
+                    reason="record_already_stopped",
+                )
+                handle.managed_process_record = None
+                return
+
+        if process_record is None:
             return
 
-        if process.returncode is not None:
-            self._delete_registry_record(handle, pid=process.pid)
-            return
-
-        process_record = self._build_record_for_handle(handle, process.pid)
         terminated = await self._terminate_record_process(process_record)
         if not terminated or self._record_is_running(process_record):
             log_event(
@@ -292,13 +395,18 @@ class OpenCodeSupervisor:
             )
             return
 
-        if process.returncode is None:
+        if process is not None and process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), timeout=2)
             except asyncio.TimeoutError:
                 pass
         if not self._record_is_running(process_record):
-            self._delete_registry_record(handle, pid=process_record.pid)
+            self._delete_registry_record(
+                handle,
+                pid=process_record.pid,
+                reason="terminated",
+            )
+            handle.managed_process_record = None
 
     async def _ensure_handle(
         self, handle_id: str, workspace_root: Path
@@ -320,6 +428,7 @@ class OpenCodeSupervisor:
                 workspace_root=workspace_root,
                 process=None,
                 client=None,
+                managed_process_record=None,
                 base_url=None,
                 health_info=None,
                 version=None,
@@ -329,6 +438,14 @@ class OpenCodeSupervisor:
                 last_used_at=time.monotonic(),
             )
             self._handles[handle_id] = handle
+        log_event(
+            self._logger,
+            logging.DEBUG,
+            "opencode.handle.created",
+            workspace_id=handle_id,
+            workspace_root=str(workspace_root),
+            server_scope=self._server_scope,
+        )
         for handle in handles_to_close:
             await self._close_handle(
                 handle,
@@ -342,9 +459,16 @@ class OpenCodeSupervisor:
         async with handle.start_lock:
             if handle.started:
                 if handle.process is None:
+                    record = handle.managed_process_record
+                    if record is None:
+                        return
+                    if self._record_is_running(record):
+                        return
+                    await self._reset_handle_state(handle, clear_process=False)
+                elif handle.process.returncode is None:
                     return
-                if handle.process.returncode is None:
-                    return
+                else:
+                    await self._reset_handle_state(handle, clear_process=True)
             if self._base_url:
                 await self._ensure_started_base_url(handle)
             else:
@@ -353,13 +477,38 @@ class OpenCodeSupervisor:
                     return
                 await self._start_process(handle)
 
+    async def _reset_handle_state(
+        self, handle: OpenCodeHandle, *, clear_process: bool
+    ) -> None:
+        await self._safe_close_client(handle.client)
+        handle.client = None
+        handle.base_url = None
+        handle.health_info = None
+        handle.version = None
+        handle.openapi_spec = None
+        handle.started = False
+        handle.managed_process_record = None
+        if clear_process:
+            handle.process = None
+
     async def _ensure_started_base_url(self, handle: OpenCodeHandle) -> None:
         base_url = self._base_url
         if not base_url:
             return
+        handle.managed_process_record = None
         await self._attach_to_base_url(handle, base_url)
+        log_event(
+            self._logger,
+            logging.INFO,
+            "opencode.external.attached",
+            workspace_id=handle.workspace_id,
+            workspace_root=str(handle.workspace_root),
+            base_url=base_url,
+            mode=self._handle_mode(handle),
+        )
 
     async def _start_process(self, handle: OpenCodeHandle) -> None:
+        handle.managed_process_record = None
         if self._base_url:
             handle.health_info = {}
             handle.version = "external"
@@ -372,6 +521,15 @@ class OpenCodeSupervisor:
             return
 
         env = self._build_opencode_env(handle.workspace_root)
+        log_event(
+            self._logger,
+            logging.INFO,
+            "opencode.process.starting",
+            workspace_id=handle.workspace_id,
+            workspace_root=str(handle.workspace_root),
+            command=list(self._command),
+            server_scope=self._server_scope,
+        )
         process = await asyncio.create_subprocess_exec(
             *self._command,
             cwd=handle.workspace_root,
@@ -420,6 +578,17 @@ class OpenCodeSupervisor:
             self._start_stdout_drain(handle)
             handle.started = True
             self._write_registry_record(handle)
+            log_event(
+                self._logger,
+                logging.INFO,
+                "opencode.process.started",
+                workspace_id=handle.workspace_id,
+                workspace_root=str(handle.workspace_root),
+                pid=process.pid,
+                pgid=self._record_pid_and_pgid(process.pid)[1],
+                base_url=base_url,
+                mode=self._handle_mode(handle),
+            )
         except Exception:
             handle.started = False
             process.terminate()
@@ -451,18 +620,51 @@ class OpenCodeSupervisor:
                 return False
 
             if record is None:
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "opencode.registry.miss",
+                    workspace_id=handle.workspace_id,
+                    workspace_root=str(handle.workspace_root),
+                )
                 await self._start_process(handle)
                 return True
 
             if not self._record_pid_is_running(record):
-                self._delete_registry_record(handle, pid=record.pid)
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "opencode.registry.stale",
+                    workspace_id=handle.workspace_id,
+                    workspace_root=str(handle.workspace_root),
+                    pid=record.pid,
+                    pgid=record.pgid,
+                    base_url=record.base_url,
+                    last_attach_mode=record.metadata.get("last_attach_mode"),
+                )
+                self._delete_registry_record(
+                    handle,
+                    pid=record.pid,
+                    reason="stale_registry_record",
+                )
                 await self._start_process(handle)
                 return True
 
             if not record.base_url:
-                if self._record_is_running(record):
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "opencode.registry.missing_base_url",
+                    workspace_id=handle.workspace_id,
+                    workspace_root=str(handle.workspace_root),
+                    pid=record.pid,
+                    pgid=record.pgid,
+                )
+                running = self._record_is_running(record)
+                if running:
                     terminated = await self._terminate_record_process(record)
-                    if not terminated:
+                    running = self._record_is_running(record)
+                    if not terminated and running:
                         log_event(
                             self._logger,
                             logging.WARNING,
@@ -472,8 +674,10 @@ class OpenCodeSupervisor:
                             pid=record.pid,
                             pgid=record.pgid,
                         )
-                        return False
-                    if self._record_is_running(record):
+                        raise OpenCodeSupervisorError(
+                            "Failed to terminate OpenCode registry record without base URL"
+                        )
+                    if running:
                         log_event(
                             self._logger,
                             logging.WARNING,
@@ -483,13 +687,21 @@ class OpenCodeSupervisor:
                             pid=record.pid,
                             pgid=record.pgid,
                         )
-                        return False
-                self._delete_registry_record(handle, pid=record.pid)
+                        raise OpenCodeSupervisorError(
+                            "OpenCode registry record without base URL remained running after termination"
+                        )
+                self._delete_registry_record(
+                    handle,
+                    pid=record.pid,
+                    reason="missing_base_url",
+                )
                 await self._start_process(handle)
                 return True
 
             try:
+                handle.managed_process_record = None
                 await self._attach_to_base_url(handle, record.base_url)
+                handle.managed_process_record = record
                 self._refresh_registry_ownership(handle, record)
                 log_event(
                     self._logger,
@@ -500,15 +712,18 @@ class OpenCodeSupervisor:
                     pid=record.pid,
                     pgid=record.pgid,
                     base_url=record.base_url,
+                    mode=self._handle_mode(handle),
                 )
                 return True
             except OpenCodeSupervisorAttachAuthError:
                 raise
-            except Exception:
+            except Exception as exc:
+                running = self._record_is_running(record)
                 terminated = False
-                if self._record_is_running(record):
+                if running:
                     terminated = await self._terminate_record_process(record)
-                if not terminated or self._record_is_running(record):
+                    running = self._record_is_running(record)
+                if not terminated and running:
                     log_event(
                         self._logger,
                         logging.WARNING,
@@ -518,8 +733,37 @@ class OpenCodeSupervisor:
                         pid=record.pid,
                         pgid=record.pgid,
                     )
-                    return False
-                self._delete_registry_record(handle, pid=record.pid)
+                    raise OpenCodeSupervisorError(
+                        "Failed to terminate stale OpenCode registry record after reuse attach failure"
+                    ) from exc
+                if running:
+                    log_event(
+                        self._logger,
+                        logging.WARNING,
+                        "opencode.handle.close_failed",
+                        workspace_id=handle.workspace_id,
+                        workspace_root=str(handle.workspace_root),
+                        pid=record.pid,
+                        pgid=record.pgid,
+                    )
+                    raise OpenCodeSupervisorError(
+                        "Stale OpenCode registry record remained running after reuse attach failure"
+                    ) from exc
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "opencode.registry.reuse_failed_restart",
+                    workspace_id=handle.workspace_id,
+                    workspace_root=str(handle.workspace_root),
+                    pid=record.pid,
+                    pgid=record.pgid,
+                    base_url=record.base_url,
+                )
+                self._delete_registry_record(
+                    handle,
+                    pid=record.pid,
+                    reason="reuse_attach_failed",
+                )
                 await self._start_process(handle)
                 return True
 
@@ -716,11 +960,33 @@ class OpenCodeSupervisor:
     def _current_record_timestamp(self) -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    def _pid_record_metadata(self, handle: OpenCodeHandle) -> dict[str, str]:
-        return {
-            "workspace_root": str(handle.workspace_root),
-            "workspace_id": handle.workspace_id,
-        }
+    def _record_metadata(
+        self,
+        handle: OpenCodeHandle,
+        *,
+        existing: Optional[dict[str, Any]] = None,
+        process_origin: Optional[str] = None,
+        last_attach_mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = dict(existing or {})
+        metadata["workspace_root"] = str(handle.workspace_root)
+        metadata["workspace_id"] = handle.workspace_id
+        metadata["server_scope"] = self._server_scope
+        metadata["ownership"] = "car_managed"
+        if process_origin is not None:
+            metadata["process_origin"] = process_origin
+        elif "process_origin" not in metadata:
+            metadata["process_origin"] = "spawned_local"
+        if last_attach_mode is not None:
+            metadata["last_attach_mode"] = last_attach_mode
+        elif "last_attach_mode" not in metadata:
+            metadata["last_attach_mode"] = metadata.get(
+                "process_origin", "spawned_local"
+            )
+        return metadata
+
+    def _pid_record_metadata(self, handle: OpenCodeHandle) -> dict[str, Any]:
+        return self._record_metadata(handle)
 
     def _build_record_for_handle(
         self, handle: OpenCodeHandle, pid: int
@@ -735,7 +1001,11 @@ class OpenCodeSupervisor:
             command=list(self._command),
             owner_pid=os.getpid(),
             started_at=self._current_record_timestamp(),
-            metadata={"workspace_root": str(handle.workspace_root)},
+            metadata=self._record_metadata(
+                handle,
+                process_origin="spawned_local",
+                last_attach_mode="spawned_local",
+            ),
         )
 
     def _build_pid_record(
@@ -772,13 +1042,19 @@ class OpenCodeSupervisor:
             command=list(self._command),
             owner_pid=os.getpid(),
             started_at=self._current_record_timestamp(),
-            metadata={"workspace_root": str(handle.workspace_root)},
+            metadata=self._record_metadata(
+                handle,
+                process_origin="spawned_local",
+                last_attach_mode="spawned_local",
+            ),
         )
         pid_record = self._build_pid_record(handle, record)
         registry_root = self._registry_root(handle.workspace_root)
+        write_count = 0
         for registry_record in (record, pid_record):
             try:
                 write_process_record(registry_root, registry_record)
+                write_count += 1
             except Exception as exc:
                 log_event(
                     self._logger,
@@ -789,6 +1065,19 @@ class OpenCodeSupervisor:
                     record_key=registry_record.record_key(),
                     exc=exc,
                 )
+        if write_count:
+            log_event(
+                self._logger,
+                logging.INFO,
+                "opencode.registry.written",
+                workspace_id=handle.workspace_id,
+                workspace_root=str(handle.workspace_root),
+                pid=process.pid,
+                base_url=handle.base_url,
+                write_count=write_count,
+                process_origin="spawned_local",
+                last_attach_mode="spawned_local",
+            )
 
     def _registry_lock_path(self, registry_root: Path, handle_id: str) -> Path:
         return (
@@ -811,11 +1100,17 @@ class OpenCodeSupervisor:
             command=record.command,
             owner_pid=os.getpid(),
             started_at=record.started_at,
-            metadata=record.metadata,
+            metadata=self._record_metadata(
+                handle,
+                existing=record.metadata,
+                last_attach_mode="registry_reuse",
+            ),
         )
         registry_root = self._registry_root(handle.workspace_root)
+        refreshed = False
         try:
             write_process_record(registry_root, updated)
+            refreshed = True
         except Exception as exc:
             log_event(
                 self._logger,
@@ -836,10 +1131,15 @@ class OpenCodeSupervisor:
             command=list(record.command),
             owner_pid=os.getpid(),
             started_at=record.started_at,
-            metadata=self._pid_record_metadata(handle),
+            metadata=self._record_metadata(
+                handle,
+                existing=updated.metadata,
+                last_attach_mode="registry_reuse",
+            ),
         )
         try:
             write_process_record(registry_root, pid_record)
+            refreshed = True
         except Exception as exc:
             log_event(
                 self._logger,
@@ -850,17 +1150,58 @@ class OpenCodeSupervisor:
                 record_key=str(record.pid),
                 exc=exc,
             )
+        if refreshed:
+            log_event(
+                self._logger,
+                logging.INFO,
+                "opencode.registry.refreshed",
+                workspace_id=handle.workspace_id,
+                workspace_root=str(handle.workspace_root),
+                pid=record.pid,
+                pgid=record.pgid,
+                base_url=record.base_url,
+                last_attach_mode="registry_reuse",
+            )
 
     def _delete_registry_record(
-        self, handle: OpenCodeHandle, *, pid: int | None = None
+        self,
+        handle: OpenCodeHandle,
+        *,
+        pid: int | None = None,
+        reason: str = "unspecified",
     ) -> None:
         try:
             registry_root = self._registry_root(handle.workspace_root)
-            delete_process_record(registry_root, _PROCESS_KIND, handle.workspace_id)
+            deleted_workspace = delete_process_record(
+                registry_root, _PROCESS_KIND, handle.workspace_id
+            )
+            deleted_pid = False
             if pid is not None:
-                delete_process_record(registry_root, _PROCESS_KIND, str(pid))
-        except Exception:
-            pass
+                deleted_pid = delete_process_record(
+                    registry_root, _PROCESS_KIND, str(pid)
+                )
+            log_event(
+                self._logger,
+                logging.INFO,
+                "opencode.registry.deleted",
+                workspace_id=handle.workspace_id,
+                workspace_root=str(handle.workspace_root),
+                pid=pid,
+                deleted_workspace=deleted_workspace,
+                deleted_pid=deleted_pid,
+                reason=reason,
+            )
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "opencode.registry.delete_failed",
+                workspace_id=handle.workspace_id,
+                workspace_root=str(handle.workspace_root),
+                pid=pid,
+                reason=reason,
+                exc=exc,
+            )
 
     async def _terminate_record_process(self, record: ProcessRecord) -> bool:
         if record.pid is None and record.pgid is None:
@@ -1020,9 +1361,39 @@ class OpenCodeSupervisor:
             last_used_at_getter=lambda h: h.last_used_at or 0.0,
         )
 
+    def _handle_mode(self, handle: OpenCodeHandle) -> str:
+        if self._base_url:
+            return "external_base_url"
+        if handle.process is not None and handle.process.pid is not None:
+            return "managed_spawned"
+        if handle.managed_process_record is not None:
+            return "managed_registry_reuse"
+        return "uninitialized"
+
+    def _handle_snapshot(self, handle: OpenCodeHandle) -> OpenCodeHandleSnapshot:
+        return OpenCodeHandleSnapshot(
+            workspace_id=handle.workspace_id,
+            workspace_root=str(handle.workspace_root),
+            mode=self._handle_mode(handle),
+            base_url=handle.base_url,
+            process_pid=(
+                handle.process.pid
+                if handle.process is not None and handle.process.pid is not None
+                else None
+            ),
+            managed_pid=(
+                handle.managed_process_record.pid
+                if handle.managed_process_record is not None
+                else None
+            ),
+            active_turns=handle.active_turns,
+            started=handle.started,
+        )
+
 
 __all__ = [
     "OpenCodeHandle",
+    "OpenCodeHandleSnapshot",
     "OpenCodeSupervisor",
     "OpenCodeSupervisorError",
     "OpenCodeSupervisorSnapshot",

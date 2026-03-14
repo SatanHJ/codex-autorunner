@@ -9,13 +9,17 @@ CAR supports multiple AI agents through a registry and capability model. Each ag
 - **Supervisor**: Manages agent process lifecycle (for agents that run as subprocesses)
 - **Registry**: Central registration with capabilities
 
+If an external runtime does not expose a documented public thread/session API, do not claim that it satisfies CAR's durable-thread contract. You may keep a narrow CAR-owned wrapper around the documented surface for experimental use, but leave `durable_threads` and the related orchestration capabilities absent until the runtime exposes a real resumable handle. The current ZeroClaw adapter is the reference example for this downgrade path.
+
 ## Prerequisites
 
 Before adding a new agent, ensure:
 1. The agent binary/CLI is available and callable
 2. The agent has a documented protocol or API (JSON-RPC, HTTP, etc.)
-3. The agent supports basic operations: conversations, turns, model listing
+3. The agent supports durable thread/session operations: create, resume, and execute turns
 4. You have tested the agent works independently of CAR
+
+**Important**: Single-session or wrapper-managed volatile runtimes are out of scope for CAR v1 orchestration. See "Single-Session Runtimes (Out of Scope for v1)" below.
 
 ## Step 1: Create the Harness
 
@@ -340,14 +344,63 @@ async def test_myagent_smoke():
 
 All agents should support these core capabilities:
 
-- **`threads`**: List, create, and resume conversations
-- **`turns`**: Start and execute turns
+- **`durable_threads`**: List, create, and resume conversations that persist across CAR restarts
+- **`message_turns`**: Start and execute turns within durable threads
 - **`model_listing`**: Return available models
 
 Optional capabilities:
 - **`review`**: Run code review operations
 - **`event_streaming`**: Stream turn events in real-time
 - **`approvals`**: Support approval/workflow mechanisms
+- **`interrupt`**: Interrupt a running turn
+- **`active_thread_discovery`**: List existing conversations
+- **`transcript_history`**: Retrieve conversation transcript history
+
+## Durable-Thread Contract (Must-Support)
+
+CAR v1 orchestration requires agents to implement a **durable thread/session model**. This means:
+
+1. **Threads persist beyond a single interaction**: Creating a conversation produces a session ID that remains valid across CAR restarts
+2. **Threads support resume**: Given a thread/session ID, the agent can resume from where it left off
+3. **Turns are atomic**: Each turn has a clear start and terminal state
+
+The must-support core interface is:
+
+```python
+async def new_conversation(workspace_root: Path, title: Optional[str]) -> ConversationRef
+async def resume_conversation(workspace_root: Path, conversation_id: str) -> ConversationRef
+async def start_turn(...) -> TurnRef
+async def wait_for_turn(...) -> TerminalTurnResult
+```
+
+**Capability gating**: Optional features like `interrupt`, `review`, `transcript_history`, and `event_streaming` raise `UnsupportedAgentCapabilityError` when called on agents that don't advertise them.
+
+## Single-Session Runtimes (Out of Scope for v1)
+
+**Single-session runtimes are explicitly out of scope for CAR v1 orchestration.** These are runtimes that:
+
+- Do not persist conversation state beyond a single request/response cycle
+- Cannot resume a previous conversation
+- Do not expose a session/conversation ID that can be stored and reused
+
+Examples of out-of-scope runtimes:
+- Stateless CLI tools that process one prompt and exit
+- Web APIs that don't expose session tokens
+- Agents without persistent conversation storage
+
+## Capability-Gated Behavior
+
+CAR uses capability discovery to determine what operations an agent supports:
+
+1. **Static capabilities**: Declared in `AgentDescriptor.capabilities` at registration
+2. **Runtime capabilities**: Reported via `harness.runtime_capability_report()` after initialization
+
+The harness automatically gates optional helper methods:
+- Calling `model_catalog()` on an agent without `model_listing` raises `UnsupportedAgentCapabilityError`
+- Calling `interrupt()` on an agent without `interrupt` raises `UnsupportedAgentCapabilityError`
+- Calling `transcript_history()` on an agent without `transcript_history` raises `UnsupportedAgentCapabilityError`
+
+This ensures graceful degradation: CAR services can attempt operations and handle missing capabilities gracefully.
 
 ## Protocol Snapshot Gate (Optional)
 
@@ -402,3 +455,42 @@ Before submitting, verify:
 - Existing implementations: `src/codex_autorunner/agents/codex/`, `src/codex_autorunner/agents/opencode/`
 - Agent harness protocol: `src/codex_autorunner/agents/base.py`
 - Registry: `src/codex_autorunner/agents/registry.py`
+
+## CAR-Native Targets vs Helper Subsystems
+
+CAR distinguishes between **orchestration-visible native targets** and **helper subsystems**:
+
+### Native Targets (Durable, Addressable)
+
+Native targets are CAR-native services that participate in orchestration routing. They are:
+- Durable: persist across CAR restarts
+- Addressable: can be targeted by surfaces for work distribution
+- First-class: visible in orchestration catalog for discovery
+
+**Examples:**
+- `ticket_flow`: CAR-native flow execution engine for deterministic multi-step delivery work
+- `pma`: CAR-native thread management and orchestration client for durable conversation threads
+
+### Helper Subsystems (Internal Plumbing)
+
+Helper subsystems are internal components that should NOT be exposed as standalone orchestration targets:
+- Dispatch interception handlers
+- Reactive debounce logic
+- Event projection services
+- Transcript mirroring services
+
+These remain internal plumbing rather than user-addressable target identities.
+
+### How Native Targets Are Registered
+
+Native targets are registered in the orchestration catalog:
+
+```python
+from codex_autorunner.core.orchestration import (
+    list_native_target_definitions,
+    get_native_target_definition,
+    NativeTargetCatalog,
+)
+```
+
+See `src/codex_autorunner/core/orchestration/catalog.py` for the registry of native targets.

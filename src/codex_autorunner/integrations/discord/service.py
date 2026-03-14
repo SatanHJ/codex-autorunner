@@ -62,6 +62,10 @@ from ...core.git_utils import GitError, reset_branch_from_origin_main
 from ...core.injected_context import wrap_injected_context
 from ...core.logging_utils import log_event
 from ...core.managed_processes import reap_managed_processes
+from ...core.orchestration import (
+    ThreadControlRequest,
+    build_surface_orchestration_ingress,
+)
 from ...core.state import RunnerState
 from ...core.state_roots import resolve_global_state_root
 from ...core.ticket_flow_projection import select_authoritative_run_record
@@ -86,6 +90,7 @@ from ...integrations.agents.opencode_supervisor_factory import (
 )
 from ...integrations.app_server.client import CodexAppServerClient
 from ...integrations.app_server.env import app_server_env, build_app_server_env
+from ...integrations.app_server.event_buffer import AppServerEventBuffer
 from ...integrations.app_server.supervisor import WorkspaceAppServerSupervisor
 from ...integrations.app_server.threads import (
     FILE_CHAT_OPENCODE_PREFIX,
@@ -231,6 +236,7 @@ from .message_turns import (
     DiscordMessageTurnResult,
     resolve_bound_workspace_root,
     run_agent_turn_for_message,
+    run_managed_thread_turn_for_message,
 )
 from .message_turns import (
     handle_message_event as handle_discord_message_event,
@@ -426,6 +432,38 @@ class _OpenCodeSupervisorCacheEntry:
     last_requested_at: float
 
 
+class _DiscordAppServerSupervisorAdapter:
+    def __init__(self, service: "DiscordBotService") -> None:
+        self._service = service
+
+    async def get_client(self, workspace_root: Path) -> CodexAppServerClient:
+        canonical_root = canonicalize_path(Path(workspace_root))
+        supervisor = await self._service._app_server_supervisor_for_workspace(
+            canonical_root
+        )
+        return await supervisor.get_client(canonical_root)
+
+    async def close_all(self) -> None:
+        await self._service._close_all_app_server_supervisors()
+
+
+class _DiscordOpenCodeSupervisorAdapter:
+    def __init__(self, service: "DiscordBotService") -> None:
+        self._service = service
+
+    async def get_client(self, workspace_root: Path) -> Any:
+        canonical_root = canonicalize_path(Path(workspace_root))
+        supervisor = await self._service._opencode_supervisor_for_workspace(
+            canonical_root
+        )
+        if supervisor is None:
+            raise RuntimeError("OpenCode supervisor unavailable")
+        return await supervisor.get_client(canonical_root)
+
+    async def close_all(self) -> None:
+        await self._service._close_all_opencode_supervisors()
+
+
 class DiscordBotService:
     def __init__(
         self,
@@ -533,6 +571,9 @@ class DiscordBotService:
         self._app_server_lock = asyncio.Lock()
         self._opencode_supervisors: dict[str, _OpenCodeSupervisorCacheEntry] = {}
         self._opencode_lock = asyncio.Lock()
+        self.app_server_events = AppServerEventBuffer()
+        self.app_server_supervisor = _DiscordAppServerSupervisorAdapter(self)
+        self.opencode_supervisor = _DiscordOpenCodeSupervisorAdapter(self)
         self._opencode_prune_task: Optional[asyncio.Task[None]] = None
         self._app_server_state_root = resolve_global_state_root() / "workspaces"
         self._channel_directory_store = ChannelDirectoryStore(self._config.root)
@@ -1689,6 +1730,7 @@ class DiscordBotService:
                 command,
                 state_root=self._app_server_state_root,
                 env_builder=self._build_workspace_env,
+                notification_handler=self.app_server_events.handle_notification,
                 logger=self._logger,
             )
             self._app_server_supervisors[key] = supervisor
@@ -2177,6 +2219,18 @@ class DiscordBotService:
         session_key: str,
         orchestrator_channel_key: str,
     ) -> DiscordMessageTurnResult:
+        if orchestrator_channel_key.startswith("pma:"):
+            return await run_managed_thread_turn_for_message(
+                self,
+                workspace_root=workspace_root,
+                prompt_text=prompt_text,
+                input_items=input_items,
+                agent=agent,
+                model_override=model_override,
+                reasoning_effort=reasoning_effort,
+                session_key=session_key,
+                orchestrator_channel_key=orchestrator_channel_key,
+            )
         return await run_agent_turn_for_message(
             self,
             workspace_root=workspace_root,
@@ -2494,12 +2548,19 @@ class DiscordBotService:
         for orchestrator in orchestrators:
             with contextlib.suppress(Exception):
                 await orchestrator.close_all()
+        await self._close_all_app_server_supervisors()
+        await self._close_all_opencode_supervisors()
+        self._reap_managed_processes(stage="shutdown")
+
+    async def _close_all_app_server_supervisors(self) -> None:
         async with self._app_server_lock:
             supervisors = list(self._app_server_supervisors.values())
             self._app_server_supervisors.clear()
         for supervisor in supervisors:
             with contextlib.suppress(Exception):
                 await supervisor.close_all()
+
+    async def _close_all_opencode_supervisors(self) -> None:
         async with self._opencode_lock:
             opencode_supervisors = [
                 entry.supervisor for entry in self._opencode_supervisors.values()
@@ -2508,7 +2569,6 @@ class DiscordBotService:
         for supervisor in opencode_supervisors:
             with contextlib.suppress(Exception):
                 await supervisor.close_all()
-        self._reap_managed_processes(stage="shutdown")
 
     async def _watch_ticket_flow_pauses(self) -> None:
         while True:
@@ -4886,7 +4946,18 @@ class DiscordBotService:
         orchestrator = await self._orchestrator_for_workspace(
             workspace_root, channel_id=orchestrator_channel_key
         )
-        had_previous = orchestrator.reset_thread_id(session_key)
+        ingress = build_surface_orchestration_ingress()
+        control_result = await ingress.run_thread_control(
+            ThreadControlRequest(
+                surface_kind="discord",
+                action="reset",
+                target_id=session_key,
+            ),
+            control_runner=lambda _request: asyncio.to_thread(
+                orchestrator.reset_thread_id, session_key
+            ),
+        )
+        had_previous = bool(control_result.control_result)
         await self._store.clear_pending_compact_seed(channel_id=channel_id)
         mode_label = "PMA" if pma_enabled else "repo"
         state_label = "cleared previous thread" if had_previous else "new thread ready"
@@ -5042,7 +5113,18 @@ class DiscordBotService:
         orchestrator = await self._orchestrator_for_workspace(
             workspace_root, channel_id=orchestrator_channel_key
         )
-        had_previous = orchestrator.reset_thread_id(session_key)
+        ingress = build_surface_orchestration_ingress()
+        control_result = await ingress.run_thread_control(
+            ThreadControlRequest(
+                surface_kind="discord",
+                action="reset",
+                target_id=session_key,
+            ),
+            control_runner=lambda _request: asyncio.to_thread(
+                orchestrator.reset_thread_id, session_key
+            ),
+        )
+        had_previous = bool(control_result.control_result)
         await self._store.clear_pending_compact_seed(channel_id=channel_id)
         mode_label = "PMA" if pma_enabled else "repo"
         state_label = "cleared previous thread" if had_previous else "new thread ready"
@@ -5173,7 +5255,18 @@ class DiscordBotService:
                 if resolved_thread_id is None:
                     return
                 thread_id = resolved_thread_id
-            orchestrator.set_thread_id(session_key, thread_id)
+            ingress = build_surface_orchestration_ingress()
+            await ingress.run_thread_control(
+                ThreadControlRequest(
+                    surface_kind="discord",
+                    action="attach",
+                    target_id=thread_id,
+                    metadata={"session_key": session_key},
+                ),
+                control_runner=lambda _request: asyncio.to_thread(
+                    orchestrator.set_thread_id, session_key, thread_id
+                ),
+            )
             await self._store.clear_pending_compact_seed(channel_id=channel_id)
             mode_label = "PMA" if pma_enabled else "repo"
             text = format_discord_message(
@@ -9008,7 +9101,18 @@ class DiscordBotService:
         orchestrator = await self._orchestrator_for_workspace(
             workspace_root, channel_id=orchestrator_channel_key
         )
-        had_previous = orchestrator.reset_thread_id(session_key)
+        ingress = build_surface_orchestration_ingress()
+        control_result = await ingress.run_thread_control(
+            ThreadControlRequest(
+                surface_kind="discord",
+                action="reset",
+                target_id=session_key,
+            ),
+            control_runner=lambda _request: asyncio.to_thread(
+                orchestrator.reset_thread_id, session_key
+            ),
+        )
+        had_previous = bool(control_result.control_result)
         await self._store.clear_pending_compact_seed(channel_id=channel_id)
         mode_label = "PMA" if pma_enabled else "repo"
         state_label = "cleared previous thread" if had_previous else "fresh state"
@@ -9986,8 +10090,16 @@ class DiscordBotService:
             reasoning_effort=None,
         )
 
+        ingress = build_surface_orchestration_ingress()
         try:
-            await orchestrator.interrupt(agent, state)
+            await ingress.run_thread_control(
+                ThreadControlRequest(
+                    surface_kind="discord",
+                    action="interrupt",
+                    target_id=context.session_id,
+                ),
+                control_runner=lambda _request: orchestrator.interrupt(agent, state),
+            )
             text = format_discord_message("Stopping current turn...")
             await self._respond_ephemeral(interaction_id, interaction_token, text)
         except Exception as exc:

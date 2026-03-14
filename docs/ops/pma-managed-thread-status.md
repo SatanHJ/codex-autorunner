@@ -40,3 +40,21 @@ API, CLI, and hub UI surfaces read these persisted fields instead of re-inferrin
 status from mixed lifecycle signals. Operator-facing payloads keep compatibility
 aliases such as `status_reason` and `status_changed_at`, while lifecycle write
 admission remains separate in `lifecycle_status`.
+
+As of the orchestration cutover, PMA thread create/list/get/resume/archive and
+status/tail reads go through the shared orchestration service seam. PMA keeps
+its operator-facing response shape, but the web and CLI surfaces no longer
+treat direct PMA store access as the primary runtime-thread query/control path.
+
+## Busy-Thread Delivery
+
+Managed-thread delivery is queue-first by default.
+
+- Sending a message to a busy thread creates a queued turn plus a durable
+  orchestration queue record.
+- `busy_policy=interrupt` (or `car pma thread send --if-busy interrupt`) keeps
+  interrupt as a first-class operation when the runtime supports it.
+- `busy_policy=reject` preserves the old fail-fast behavior for callers that
+  explicitly want it.
+- `/hub/pma/threads/{id}/status` and `car pma thread status` expose both the
+  active turn and any queued turns behind it.

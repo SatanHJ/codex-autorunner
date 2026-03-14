@@ -1,0 +1,700 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+import pytest
+
+from codex_autorunner.agents.registry import AgentDescriptor
+from codex_autorunner.agents.types import TerminalTurnResult
+from codex_autorunner.core.orchestration import (
+    HarnessBackedOrchestrationService,
+    MappingAgentDefinitionCatalog,
+    MessageRequest,
+    OrchestrationBindingStore,
+    PausedFlowTarget,
+    PmaThreadExecutionStore,
+    SurfaceThreadMessageRequest,
+)
+from codex_autorunner.core.orchestration.models import FlowTarget
+from codex_autorunner.core.orchestration.service import (
+    build_harness_backed_orchestration_service,
+    build_surface_orchestration_ingress,
+    get_surface_orchestration_ingress,
+)
+from codex_autorunner.core.pma_thread_store import PmaThreadStore
+
+
+@dataclass
+class _FakeConversation:
+    id: str
+
+
+@dataclass
+class _FakeTurn:
+    turn_id: str
+
+
+@dataclass
+class _FakeHarness:
+    display_name: str = "Codex"
+    capabilities: frozenset[str] = frozenset(
+        ["durable_threads", "message_turns", "interrupt", "review"]
+    )
+    next_conversation_id: str = "backend-conversation-1"
+    resumed_conversation_id: Optional[str] = None
+    next_turn_id: str = "backend-turn-1"
+    ensure_ready_error: Optional[Exception] = None
+    ensure_ready_calls: list[Path] = field(default_factory=list)
+    new_conversation_calls: list[tuple[Path, Optional[str]]] = field(
+        default_factory=list
+    )
+    resume_conversation_calls: list[tuple[Path, str]] = field(default_factory=list)
+    start_turn_calls: list[dict[str, Any]] = field(default_factory=list)
+    start_review_calls: list[dict[str, Any]] = field(default_factory=list)
+    interrupt_calls: list[tuple[Path, str, Optional[str]]] = field(default_factory=list)
+
+    async def ensure_ready(self, workspace_root: Path) -> None:
+        self.ensure_ready_calls.append(workspace_root)
+        if self.ensure_ready_error is not None:
+            raise self.ensure_ready_error
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+    async def new_conversation(
+        self, workspace_root: Path, title: Optional[str] = None
+    ) -> _FakeConversation:
+        self.new_conversation_calls.append((workspace_root, title))
+        return _FakeConversation(id=self.next_conversation_id)
+
+    async def resume_conversation(
+        self, workspace_root: Path, conversation_id: str
+    ) -> _FakeConversation:
+        self.resume_conversation_calls.append((workspace_root, conversation_id))
+        return _FakeConversation(id=self.resumed_conversation_id or conversation_id)
+
+    async def start_turn(
+        self,
+        workspace_root: Path,
+        conversation_id: str,
+        prompt: str,
+        model: Optional[str],
+        reasoning: Optional[str],
+        *,
+        approval_mode: Optional[str],
+        sandbox_policy: Optional[Any],
+        input_items: Optional[list[dict[str, Any]]] = None,
+    ) -> _FakeTurn:
+        self.start_turn_calls.append(
+            {
+                "workspace_root": workspace_root,
+                "conversation_id": conversation_id,
+                "prompt": prompt,
+                "model": model,
+                "reasoning": reasoning,
+                "approval_mode": approval_mode,
+                "sandbox_policy": sandbox_policy,
+                "input_items": input_items,
+            }
+        )
+        return _FakeTurn(turn_id=self.next_turn_id)
+
+    async def start_review(
+        self,
+        workspace_root: Path,
+        conversation_id: str,
+        prompt: str,
+        model: Optional[str],
+        reasoning: Optional[str],
+        *,
+        approval_mode: Optional[str],
+        sandbox_policy: Optional[Any],
+    ) -> _FakeTurn:
+        self.start_review_calls.append(
+            {
+                "workspace_root": workspace_root,
+                "conversation_id": conversation_id,
+                "prompt": prompt,
+                "model": model,
+                "reasoning": reasoning,
+                "approval_mode": approval_mode,
+                "sandbox_policy": sandbox_policy,
+            }
+        )
+        return _FakeTurn(turn_id=self.next_turn_id)
+
+    async def interrupt(
+        self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+    ) -> None:
+        self.interrupt_calls.append((workspace_root, conversation_id, turn_id))
+
+    async def wait_for_turn(
+        self,
+        workspace_root: Path,
+        conversation_id: str,
+        turn_id: Optional[str],
+        *,
+        timeout: Optional[float] = None,
+    ) -> TerminalTurnResult:
+        _ = workspace_root, conversation_id, turn_id, timeout
+        return TerminalTurnResult(status="ok", assistant_text="Done")
+
+    async def stream_events(
+        self, workspace_root: Path, conversation_id: str, turn_id: str
+    ):
+        if False:
+            yield f"{workspace_root}:{conversation_id}:{turn_id}"
+
+
+def _make_descriptor(
+    agent_id: str = "codex",
+    *,
+    name: str = "Codex",
+    capabilities: Optional[frozenset[str]] = None,
+) -> AgentDescriptor:
+    return AgentDescriptor(
+        id=agent_id,
+        name=name,
+        capabilities=(
+            capabilities
+            if capabilities is not None
+            else frozenset(["threads", "turns", "review", "approvals"])
+        ),
+        make_harness=lambda _ctx: None,  # type: ignore[return-value]
+    )
+
+
+def _build_service(
+    tmp_path: Path, harness: _FakeHarness
+) -> HarnessBackedOrchestrationService:
+    descriptors = {"codex": _make_descriptor()}
+    catalog = MappingAgentDefinitionCatalog(descriptors)
+    store = PmaThreadExecutionStore(PmaThreadStore(tmp_path / "hub"))
+    return HarnessBackedOrchestrationService(
+        definition_catalog=catalog,
+        thread_store=store,
+        harness_factory=lambda agent_id: harness,
+    )
+
+
+def test_service_lists_definitions_and_resolves_thread_targets(tmp_path: Path) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    definitions = service.list_agent_definitions()
+    assert [definition.agent_id for definition in definitions] == ["codex"]
+
+    created = service.create_thread_target(
+        "codex",
+        workspace_root,
+        repo_id="repo-1",
+        display_name="Backlog",
+    )
+    resolved = service.resolve_thread_target(
+        thread_target_id=created.thread_target_id,
+        agent_id="codex",
+        workspace_root=workspace_root,
+    )
+
+    assert resolved.thread_target_id == created.thread_target_id
+    assert resolved.workspace_root == str(workspace_root)
+    assert service.get_thread_status(created.thread_target_id) is not None
+
+
+def test_create_thread_target_rejects_non_durable_agent(tmp_path: Path) -> None:
+    harness = _FakeHarness(capabilities=frozenset())
+    descriptors = {
+        "zeroclaw": _make_descriptor(
+            "zeroclaw",
+            name="ZeroClaw",
+            capabilities=frozenset(),
+        )
+    }
+    catalog = MappingAgentDefinitionCatalog(descriptors)
+    store = PmaThreadExecutionStore(PmaThreadStore(tmp_path / "hub"))
+    service = HarnessBackedOrchestrationService(
+        definition_catalog=catalog,
+        thread_store=store,
+        harness_factory=lambda agent_id: harness,
+    )
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    with pytest.raises(ValueError, match="does not support durable_threads"):
+        service.create_thread_target("zeroclaw", workspace_root)
+
+
+async def test_send_message_creates_conversation_and_execution(tmp_path: Path) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target(
+        "codex",
+        workspace_root,
+        repo_id="repo-1",
+        display_name="Backlog",
+    )
+
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Ship it",
+            model="gpt-5",
+            reasoning="medium",
+            approval_mode="on-request",
+            input_items=[
+                {"type": "text", "text": "Ship it"},
+                {"type": "localImage", "path": str(tmp_path / "diagram.png")},
+            ],
+        ),
+        client_request_id="client-1",
+        sandbox_policy={"mode": "workspace-write"},
+    )
+
+    refreshed_thread = service.get_thread_target(thread.thread_target_id)
+    running = service.get_running_execution(thread.thread_target_id)
+
+    assert harness.ensure_ready_calls == [workspace_root]
+    assert harness.new_conversation_calls == [(workspace_root, "Backlog")]
+    assert harness.resume_conversation_calls == []
+    assert harness.start_turn_calls[0]["conversation_id"] == "backend-conversation-1"
+    assert harness.start_turn_calls[0]["input_items"] == [
+        {"type": "text", "text": "Ship it"},
+        {"type": "localImage", "path": str(tmp_path / "diagram.png")},
+    ]
+    assert execution.status == "running"
+    assert execution.backend_id == "backend-turn-1"
+    assert refreshed_thread is not None
+    assert refreshed_thread.backend_thread_id == "backend-conversation-1"
+    assert refreshed_thread.last_execution_id == execution.execution_id
+    assert refreshed_thread.last_message_preview == "Ship it"
+    assert running is not None
+    assert running.execution_id == execution.execution_id
+
+
+async def test_send_review_resumes_existing_backend_thread(tmp_path: Path) -> None:
+    harness = _FakeHarness(next_conversation_id="unused", next_turn_id="review-turn-1")
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target(
+        "codex",
+        workspace_root,
+        backend_thread_id="backend-existing-1",
+        display_name="Review Thread",
+    )
+
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Review this patch",
+            kind="review",
+        )
+    )
+
+    assert harness.new_conversation_calls == []
+    assert harness.resume_conversation_calls == [(workspace_root, "backend-existing-1")]
+    assert harness.start_review_calls[0]["conversation_id"] == "backend-existing-1"
+    assert execution.backend_id == "review-turn-1"
+
+
+async def test_send_message_persists_canonical_resumed_conversation_id(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(resumed_conversation_id="backend-canonical-2")
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target(
+        "codex",
+        workspace_root,
+        backend_thread_id="backend-existing-1",
+        display_name="Canonical Thread",
+    )
+
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Continue the session",
+        )
+    )
+
+    refreshed_thread = service.get_thread_target(thread.thread_target_id)
+
+    assert harness.resume_conversation_calls == [(workspace_root, "backend-existing-1")]
+    assert harness.start_turn_calls[0]["conversation_id"] == "backend-canonical-2"
+    assert execution.backend_id == "backend-turn-1"
+    assert refreshed_thread is not None
+    assert refreshed_thread.backend_thread_id == "backend-canonical-2"
+
+
+async def test_send_message_queues_when_thread_is_busy_by_default(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+
+    running = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="first",
+        )
+    )
+    queued = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="second",
+        )
+    )
+
+    assert running.status == "running"
+    assert queued.status == "queued"
+    assert len(harness.start_turn_calls) == 1
+    assert service.get_queue_depth(thread.thread_target_id) == 1
+    queued_rows = service.list_queued_executions(thread.thread_target_id)
+    refreshed_thread = service.get_thread_target(thread.thread_target_id)
+    assert [row.execution_id for row in queued_rows] == [queued.execution_id]
+    assert refreshed_thread is not None
+    assert refreshed_thread.last_execution_id == queued.execution_id
+    assert refreshed_thread.last_message_preview == "second"
+
+
+async def test_send_message_interrupts_busy_thread_when_requested(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(next_turn_id="backend-turn-1")
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+
+    first = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="first",
+        )
+    )
+    harness.next_turn_id = "backend-turn-2"
+    second = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="second",
+            busy_policy="interrupt",
+        )
+    )
+
+    assert first.status == "running"
+    assert harness.interrupt_calls == [
+        (workspace_root, "backend-conversation-1", "backend-turn-1")
+    ]
+    assert len(harness.start_turn_calls) == 2
+    assert second.status == "running"
+    assert second.backend_id == "backend-turn-2"
+    assert service.get_queue_depth(thread.thread_target_id) == 0
+
+
+async def test_interrupt_thread_uses_harness_and_marks_execution(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+    await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Need an answer",
+        )
+    )
+
+    interrupted = await service.interrupt_thread(thread.thread_target_id)
+
+    assert harness.interrupt_calls == [
+        (workspace_root, "backend-conversation-1", "backend-turn-1")
+    ]
+    assert interrupted.status == "interrupted"
+
+
+async def test_cancel_queued_executions_marks_queued_rows_interrupted(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+
+    running = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="first",
+        )
+    )
+    queued = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="second",
+        )
+    )
+
+    cancelled = service.cancel_queued_executions(thread.thread_target_id)
+
+    assert running.status == "running"
+    assert queued.status == "queued"
+    assert cancelled == 1
+    cancelled_execution = service.get_execution(
+        thread.thread_target_id, queued.execution_id
+    )
+    assert cancelled_execution is not None
+    assert cancelled_execution.status == "interrupted"
+    assert service.get_queue_depth(thread.thread_target_id) == 0
+
+
+async def test_send_review_rejects_when_harness_lacks_review_capability(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(capabilities=frozenset(["durable_threads", "message_turns"]))
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Review this",
+            kind="review",
+        )
+    )
+
+    assert execution.status == "error"
+    assert execution.error == "Agent 'codex' does not support review mode"
+
+
+async def test_send_message_records_failed_execution_when_runtime_setup_fails(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(ensure_ready_error=FileNotFoundError("codex"))
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Need an answer",
+            metadata={"execution_error_message": "Managed thread execution failed"},
+        )
+    )
+
+    running = service.get_running_execution(thread.thread_target_id)
+
+    assert harness.ensure_ready_calls == [workspace_root]
+    assert harness.new_conversation_calls == []
+    assert execution.status == "error"
+    assert execution.error == "Managed thread execution failed"
+    assert running is None
+
+
+async def test_interrupt_thread_rejects_when_harness_lacks_interrupt_capability(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(capabilities=frozenset(["durable_threads", "message_turns"]))
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+    await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Need an answer",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="does not support interrupt"):
+        await service.interrupt_thread(thread.thread_target_id)
+
+
+async def test_record_execution_result_updates_execution_state(tmp_path: Path) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="Need an answer",
+        )
+    )
+    completed = service.record_execution_result(
+        thread.thread_target_id,
+        execution.execution_id,
+        status="ok",
+        assistant_text="Done",
+        backend_turn_id="backend-turn-1",
+    )
+
+    assert completed.status == "ok"
+    assert completed.output_text == "Done"
+
+
+def test_builder_wraps_pma_store_with_default_catalog(tmp_path: Path) -> None:
+    harness = _FakeHarness()
+    descriptors = {"codex": _make_descriptor()}
+    service = build_harness_backed_orchestration_service(
+        descriptors=descriptors,
+        pma_thread_store=PmaThreadStore(tmp_path / "hub"),
+        harness_factory=lambda agent_id: harness,
+    )
+
+    assert service.get_agent_definition("codex") is not None
+    assert isinstance(service.thread_store, PmaThreadExecutionStore)
+
+
+async def test_thread_service_rejects_flow_targets(tmp_path: Path) -> None:
+    harness = _FakeHarness()
+    service = _build_service(tmp_path, harness)
+
+    with pytest.raises(
+        ValueError, match="Thread orchestration service only handles thread targets"
+    ):
+        await service.send_message(
+            MessageRequest(
+                target_id="ticket-flow",
+                target_kind="flow",
+                message_text="run flow",
+            )
+        )
+
+
+async def test_surface_ingress_routes_paused_flow_before_thread(tmp_path: Path) -> None:
+    ingress = build_surface_orchestration_ingress()
+    request = SurfaceThreadMessageRequest(
+        surface_kind="discord",
+        workspace_root=tmp_path,
+        prompt_text="resume this run",
+        agent_id="codex",
+    )
+    thread_calls: list[str] = []
+
+    async def _resolve_paused_flow(
+        _request: SurfaceThreadMessageRequest,
+    ) -> PausedFlowTarget:
+        return PausedFlowTarget(
+            flow_target=FlowTarget(
+                flow_target_id="ticket_flow",
+                flow_type="ticket_flow",
+                display_name="ticket_flow",
+                workspace_root=str(tmp_path),
+            ),
+            run_id="run-1",
+            status="paused",
+            workspace_root=tmp_path,
+        )
+
+    async def _submit_flow_reply(
+        _request: SurfaceThreadMessageRequest, flow_target: PausedFlowTarget
+    ) -> str:
+        return flow_target.run_id
+
+    async def _submit_thread_message(
+        _request: SurfaceThreadMessageRequest,
+    ) -> str:
+        thread_calls.append("thread")
+        return "thread"
+
+    result = await ingress.submit_message(
+        request,
+        resolve_paused_flow_target=_resolve_paused_flow,
+        submit_flow_reply=_submit_flow_reply,
+        submit_thread_message=_submit_thread_message,
+    )
+
+    assert result.route == "flow"
+    assert result.flow_result == "run-1"
+    assert thread_calls == []
+    assert [event.event_type for event in result.events] == [
+        "ingress.received",
+        "ingress.target_resolved",
+        "ingress.flow_resumed",
+    ]
+
+
+def test_get_surface_orchestration_ingress_reuses_owner_instance() -> None:
+    class _Owner:
+        pass
+
+    owner = _Owner()
+
+    first = get_surface_orchestration_ingress(owner)
+    second = get_surface_orchestration_ingress(owner)
+
+    assert first is second
+
+
+def test_service_exposes_binding_queries_when_binding_store_is_configured(
+    tmp_path: Path,
+) -> None:
+    hub_root = tmp_path / "hub"
+    service = HarnessBackedOrchestrationService(
+        definition_catalog=MappingAgentDefinitionCatalog({"codex": _make_descriptor()}),
+        thread_store=PmaThreadExecutionStore(PmaThreadStore(hub_root)),
+        harness_factory=lambda _agent_id: _FakeHarness(),
+        binding_store=OrchestrationBindingStore(hub_root),
+    )
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target(
+        "codex",
+        workspace_root,
+        repo_id="repo-1",
+        display_name="Bound thread",
+    )
+
+    binding = service.upsert_binding(
+        surface_kind="telegram",
+        surface_key="123:root",
+        thread_target_id=thread.thread_target_id,
+        agent_id="codex",
+        repo_id="repo-1",
+    )
+
+    assert binding.thread_target_id == thread.thread_target_id
+    assert (
+        service.get_active_thread_for_binding(
+            surface_kind="telegram",
+            surface_key="123:root",
+        )
+        == thread.thread_target_id
+    )
+    assert (
+        service.get_binding(surface_kind="telegram", surface_key="123:root") is not None
+    )
+    summaries = service.list_active_work_summaries(repo_id="repo-1")
+    assert len(summaries) == 1
+    assert summaries[0].thread_target_id == thread.thread_target_id

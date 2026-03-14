@@ -329,6 +329,14 @@ class FlowController:
             flow_type=self.definition.flow_type, status=status
         )
 
+    def list_active_runs(self, *, include_paused: bool = True) -> list[FlowRunRecord]:
+        return [
+            record
+            for record in self.list_runs()
+            if record.status.is_active()
+            or (include_paused and record.status.is_paused())
+        ]
+
     async def stream_events(
         self, run_id: str, after_seq: Optional[int] = None
     ) -> AsyncGenerator[FlowEvent, None]:
@@ -408,7 +416,15 @@ class FlowController:
         if self._lifecycle_emitter is None:
             return
         try:
-            if event_type == LifecycleEventType.FLOW_PAUSED:
+            if event_type == LifecycleEventType.FLOW_STARTED:
+                self._lifecycle_emitter.emit_flow_started(
+                    repo_id, run_id, data=data, origin=origin
+                )
+            elif event_type == LifecycleEventType.FLOW_RESUMED:
+                self._lifecycle_emitter.emit_flow_resumed(
+                    repo_id, run_id, data=data, origin=origin
+                )
+            elif event_type == LifecycleEventType.FLOW_PAUSED:
                 self._lifecycle_emitter.emit_flow_paused(
                     repo_id, run_id, data=data, origin=origin
                 )

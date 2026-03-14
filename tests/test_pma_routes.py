@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import anyio
@@ -14,13 +15,16 @@ from codex_autorunner.bootstrap import pma_active_context_content, seed_hub_file
 from codex_autorunner.core import filebox
 from codex_autorunner.core.app_server_threads import PMA_KEY, PMA_OPENCODE_KEY
 from codex_autorunner.core.config import CONFIG_FILENAME, DEFAULT_HUB_CONFIG
+from codex_autorunner.core.orchestration import ExecutionRecord, ThreadTarget
 from codex_autorunner.core.pma_context import maybe_auto_prune_active_context
 from codex_autorunner.core.pma_queue import PmaQueue, QueueItemState
+from codex_autorunner.core.pma_thread_store import PmaThreadStore
 from codex_autorunner.core.pma_transcripts import PmaTranscriptStore
 from codex_autorunner.integrations.discord.state import DiscordStateStore
 from codex_autorunner.integrations.telegram.state import TelegramStateStore, topic_key
 from codex_autorunner.server import create_hub_app
 from codex_autorunner.surfaces.web.routes import pma as pma_routes
+from codex_autorunner.surfaces.web.routes.pma_routes import chat_runtime, tail_stream
 from tests.conftest import write_test_config
 
 
@@ -219,6 +223,91 @@ def test_pma_chat_requires_message(hub_env) -> None:
     assert resp.status_code == 400
 
 
+def test_pma_chat_submits_through_surface_orchestration_ingress(
+    hub_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_pma(hub_env.hub_root)
+    app = create_hub_app(hub_env.hub_root)
+    captured: dict[str, Any] = {}
+
+    class _FakeIngress:
+        async def submit_message(
+            self,
+            request,
+            *,
+            resolve_paused_flow_target,
+            submit_flow_reply,
+            submit_thread_message,
+        ):
+            _ = resolve_paused_flow_target, submit_flow_reply, submit_thread_message
+            captured["surface_kind"] = request.surface_kind
+            captured["prompt_text"] = request.prompt_text
+            captured["pma_enabled"] = request.pma_enabled
+            return SimpleNamespace(
+                route="thread",
+                thread_result={"status": "ok", "message": "ingress ok"},
+            )
+
+    monkeypatch.setattr(
+        chat_runtime,
+        "build_surface_orchestration_ingress",
+        lambda **_: _FakeIngress(),
+    )
+    app.state.app_server_supervisor = object()
+    app.state.app_server_events = object()
+
+    client = TestClient(app)
+    resp = client.post("/hub/pma/chat", json={"message": "hello through ingress"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "ok",
+        "message": "ingress ok",
+        "client_turn_id": "",
+    }
+    assert captured == {
+        "surface_kind": "web",
+        "prompt_text": "hello through ingress",
+        "pma_enabled": True,
+    }
+
+
+def test_pma_thread_status_includes_queued_turns(hub_env) -> None:
+    _enable_pma(hub_env.hub_root)
+    app = create_hub_app(hub_env.hub_root)
+
+    with TestClient(app) as client:
+        create_resp = client.post(
+            "/hub/pma/threads",
+            json={"agent": "codex", "repo_id": hub_env.repo_id},
+        )
+        assert create_resp.status_code == 200
+        managed_thread_id = create_resp.json()["thread"]["managed_thread_id"]
+
+    store = PmaThreadStore(hub_env.hub_root)
+    running_turn = store.create_turn(managed_thread_id, prompt="first")
+    queued_turn = store.create_turn(
+        managed_thread_id,
+        prompt="second",
+        busy_policy="queue",
+        queue_payload={"request": {"message_text": "second"}},
+    )
+
+    client = TestClient(app)
+    resp = client.get(f"/hub/pma/threads/{managed_thread_id}/status")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["turn"]["managed_turn_id"] == running_turn["managed_turn_id"]
+    assert payload["queue_depth"] == 1
+    assert len(payload["queued_turns"]) == 1
+    assert (
+        payload["queued_turns"][0]["managed_turn_id"] == queued_turn["managed_turn_id"]
+    )
+    assert payload["queued_turns"][0]["state"] == "queued"
+    assert payload["queued_turns"][0]["prompt_preview"] == "second"
+
+
 def test_pma_chat_rejects_oversize_message(hub_env) -> None:
     _enable_pma(hub_env.hub_root, max_text_chars=5)
     app = create_hub_app(hub_env.hub_root)
@@ -344,7 +433,9 @@ def test_pma_chat_persists_transcript_and_history_entry(hub_env) -> None:
         transcript_turn_id
     )
     assert transcript is not None
-    assert transcript["content"].strip() == "assistant transcript payload"
+    assert transcript["content"].strip() == (
+        "User:\n" "persist transcript\n\n" "Assistant:\n" "assistant transcript payload"
+    )
     metadata = transcript["metadata"]
     assert metadata["client_turn_id"] == "client-transcript"
     assert metadata["trigger"] == "user_prompt"
@@ -358,7 +449,9 @@ def test_pma_chat_persists_transcript_and_history_entry(hub_env) -> None:
 
     history_entry = client.get(f"/hub/pma/history/{transcript_turn_id}")
     assert history_entry.status_code == 200
-    assert history_entry.json()["content"].strip() == "assistant transcript payload"
+    assert history_entry.json()["content"].strip() == (
+        "User:\n" "persist transcript\n\n" "Assistant:\n" "assistant transcript payload"
+    )
 
 
 def test_pma_chat_github_injection_uses_raw_user_message(
@@ -1267,6 +1360,104 @@ def test_pma_turn_events_stream_codex_respects_resume_cursor(hub_env) -> None:
     assert fake_events.calls == [("thread-1", "turn-1", 1)]
 
 
+def test_pma_managed_thread_status_and_tail_use_orchestration_service(
+    hub_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.thread = ThreadTarget(
+                thread_target_id="thread-1",
+                agent_id="codex",
+                backend_thread_id="backend-thread-1",
+                repo_id=hub_env.repo_id,
+                workspace_root=str(hub_env.repo_root.resolve()),
+                display_name="Status thread",
+                status="completed",
+                lifecycle_status="active",
+                status_reason="managed_turn_completed",
+                status_changed_at="2026-03-13T00:01:00Z",
+                status_terminal=True,
+                status_turn_id="turn-1",
+            )
+            self.execution = ExecutionRecord(
+                execution_id="turn-1",
+                target_id="thread-1",
+                target_kind="thread",
+                status="ok",
+                backend_id="backend-turn-1",
+                started_at="2026-03-13T00:00:00Z",
+                finished_at="2026-03-13T00:01:00Z",
+                output_text="assistant output from orchestration",
+            )
+
+        def get_thread_target(self, thread_target_id: str):
+            self.calls.append(("get_thread_target", thread_target_id))
+            if thread_target_id != self.thread.thread_target_id:
+                return None
+            return self.thread
+
+        def get_running_execution(self, thread_target_id: str):
+            self.calls.append(("get_running_execution", thread_target_id))
+            return None
+
+        def get_latest_execution(self, thread_target_id: str):
+            self.calls.append(("get_latest_execution", thread_target_id))
+            return self.execution
+
+        def get_execution(self, thread_target_id: str, execution_id: str):
+            self.calls.append(("get_execution", f"{thread_target_id}:{execution_id}"))
+            return self.execution
+
+        def get_queue_depth(self, thread_target_id: str):
+            self.calls.append(("get_queue_depth", thread_target_id))
+            return 0
+
+    fake_service = FakeService()
+    monkeypatch.setattr(
+        tail_stream,
+        "build_managed_thread_orchestration_service",
+        lambda request: fake_service,
+    )
+
+    app = create_hub_app(hub_env.hub_root)
+    app.state.app_server_events = None
+    client = TestClient(app)
+
+    status_resp = client.get("/hub/pma/threads/thread-1/status")
+    tail_resp = client.get("/hub/pma/threads/thread-1/tail")
+
+    assert status_resp.status_code == 200
+    assert tail_resp.status_code == 200
+
+    status_payload = status_resp.json()
+    assert status_payload["thread"]["managed_thread_id"] == "thread-1"
+    assert status_payload["thread"]["status"] == "completed"
+    assert status_payload["turn"]["managed_turn_id"] == "turn-1"
+    assert status_payload["turn"]["status"] == "ok"
+    assert status_payload["queue_depth"] == 0
+    assert status_payload["queued_turns"] == []
+    assert (
+        status_payload["latest_output_excerpt"] == "assistant output from orchestration"
+    )
+    assert status_payload["stream_available"] is False
+
+    tail_payload = tail_resp.json()
+    assert tail_payload["managed_thread_id"] == "thread-1"
+    assert tail_payload["managed_turn_id"] == "turn-1"
+    assert tail_payload["turn_status"] == "ok"
+    assert tail_payload["backend_turn_id"] == "backend-turn-1"
+
+    assert fake_service.calls[:4] == [
+        ("get_thread_target", "thread-1"),
+        ("get_running_execution", "thread-1"),
+        ("get_latest_execution", "thread-1"),
+        ("get_thread_target", "thread-1"),
+    ]
+    assert ("get_queue_depth", "thread-1") in fake_service.calls
+    assert fake_service.calls.count(("get_running_execution", "thread-1")) >= 3
+
+
 def test_pma_files_list_empty(hub_env) -> None:
     seed_hub_files(hub_env.hub_root, force=True)
     _enable_pma(hub_env.hub_root)
@@ -2156,3 +2347,45 @@ def test_pma_automation_timer_rejects_invalid_due_at(hub_env) -> None:
         assert response.status_code == 422
 
     assert fake_store.created_payloads == []
+
+
+def test_pma_orchestration_service_integration_for_thread_operations(
+    hub_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_pma(hub_env.hub_root)
+
+    class FakeService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_thread_target(self, thread_target_id: str):
+            self.calls.append(f"get_thread_target:{thread_target_id}")
+            return None
+
+        def get_running_execution(self, thread_target_id: str):
+            self.calls.append(f"get_running_execution:{thread_target_id}")
+            return None
+
+        def get_latest_execution(self, thread_target_id: str):
+            self.calls.append(f"get_latest_execution:{thread_target_id}")
+            return None
+
+    fake_service = FakeService()
+    monkeypatch.setattr(
+        "codex_autorunner.surfaces.web.routes.pma_routes.tail_stream.build_managed_thread_orchestration_service",
+        lambda request: fake_service,
+    )
+    app = create_hub_app(hub_env.hub_root)
+
+    client = TestClient(app)
+
+    client.get("/hub/pma/threads/thread-1/status")
+    assert any(
+        call.startswith("get_thread_target:thread-1") for call in fake_service.calls
+    )
+
+    fake_service.calls.clear()
+    client.get("/hub/pma/threads/thread-1/tail")
+    assert any(
+        call.startswith("get_thread_target:thread-1") for call in fake_service.calls
+    )

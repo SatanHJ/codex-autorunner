@@ -4,23 +4,22 @@ import importlib.metadata
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Literal, Optional
+from typing import Any, Callable, Iterable, Optional
 
+from ..core.utils import resolve_executable
 from ..plugin_api import CAR_AGENT_ENTRYPOINT_GROUP, CAR_PLUGIN_API_VERSION
 from .base import AgentHarness
 from .codex.harness import CodexHarness
 from .opencode.harness import OpenCodeHarness
+from .types import RuntimeCapability, normalize_runtime_capabilities
+from .zeroclaw.harness import ZeroClawHarness
+from .zeroclaw.supervisor import (
+    build_zeroclaw_supervisor_from_config,
+    zeroclaw_binary_available,
+)
 
 _logger = logging.getLogger(__name__)
-
-AgentCapability = Literal[
-    "threads",
-    "turns",
-    "review",
-    "model_listing",
-    "event_streaming",
-    "approvals",
-]
+AgentCapability = RuntimeCapability
 
 
 @dataclass(frozen=True)
@@ -39,6 +38,19 @@ class AgentDescriptor:
     make_harness: Callable[[Any], AgentHarness]
     healthcheck: Optional[Callable[[Any], bool]] = None
     plugin_api_version: int = CAR_PLUGIN_API_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "capabilities",
+            normalize_agent_capabilities(self.capabilities),
+        )
+
+
+def normalize_agent_capabilities(
+    capabilities: Iterable[str],
+) -> frozenset[AgentCapability]:
+    return normalize_runtime_capabilities(capabilities)
 
 
 def _make_codex_harness(ctx: Any) -> AgentHarness:
@@ -66,18 +78,50 @@ def _check_opencode_health(ctx: Any) -> bool:
     return supervisor is not None
 
 
+def _make_zeroclaw_harness(ctx: Any) -> AgentHarness:
+    supervisor = getattr(ctx, "zeroclaw_supervisor", None)
+    if supervisor is None:
+        config = getattr(ctx, "config", None)
+        logger = getattr(ctx, "logger", None)
+        if config is None:
+            raise RuntimeError("ZeroClaw harness unavailable: config missing")
+        supervisor = build_zeroclaw_supervisor_from_config(config, logger=logger)
+        if supervisor is None:
+            raise RuntimeError("ZeroClaw harness unavailable: binary not configured")
+        try:
+            ctx.zeroclaw_supervisor = supervisor
+        except Exception:
+            pass
+    return ZeroClawHarness(supervisor)
+
+
+def _check_zeroclaw_health(ctx: Any) -> bool:
+    supervisor = getattr(ctx, "zeroclaw_supervisor", None)
+    if supervisor is not None:
+        return True
+    config = getattr(ctx, "config", None)
+    if config is not None:
+        return zeroclaw_binary_available(config)
+    binary = getattr(ctx, "zeroclaw_binary", None)
+    if isinstance(binary, str) and binary.strip():
+        return resolve_executable(binary.strip()) is not None
+    return False
+
+
 _BUILTIN_AGENTS: dict[str, AgentDescriptor] = {
     "codex": AgentDescriptor(
         id="codex",
         name="Codex",
         capabilities=frozenset(
             [
-                "threads",
-                "turns",
-                "review",
-                "model_listing",
-                "event_streaming",
-                "approvals",
+                RuntimeCapability("durable_threads"),
+                RuntimeCapability("message_turns"),
+                RuntimeCapability("interrupt"),
+                RuntimeCapability("active_thread_discovery"),
+                RuntimeCapability("review"),
+                RuntimeCapability("model_listing"),
+                RuntimeCapability("event_streaming"),
+                RuntimeCapability("approvals"),
             ]
         ),
         make_harness=_make_codex_harness,
@@ -88,15 +132,24 @@ _BUILTIN_AGENTS: dict[str, AgentDescriptor] = {
         name="OpenCode",
         capabilities=frozenset(
             [
-                "threads",
-                "turns",
-                "review",
-                "model_listing",
-                "event_streaming",
+                RuntimeCapability("durable_threads"),
+                RuntimeCapability("message_turns"),
+                RuntimeCapability("interrupt"),
+                RuntimeCapability("active_thread_discovery"),
+                RuntimeCapability("review"),
+                RuntimeCapability("model_listing"),
+                RuntimeCapability("event_streaming"),
             ]
         ),
         make_harness=_make_opencode_harness,
         healthcheck=_check_opencode_health,
+    ),
+    "zeroclaw": AgentDescriptor(
+        id="zeroclaw",
+        name="ZeroClaw",
+        capabilities=frozenset(),
+        make_harness=_make_zeroclaw_harness,
+        healthcheck=_check_zeroclaw_health,
     ),
 }
 
@@ -266,11 +319,14 @@ def validate_agent_id(agent_id: str) -> str:
     return normalized
 
 
-def has_capability(agent_id: str, capability: AgentCapability) -> bool:
+def has_capability(agent_id: str, capability: str) -> bool:
     descriptor = get_agent_descriptor(agent_id)
     if descriptor is None:
         return False
-    return capability in descriptor.capabilities
+    normalized = normalize_agent_capabilities([capability])
+    if not normalized:
+        return False
+    return next(iter(normalized)) in descriptor.capabilities
 
 
 __all__ = [
@@ -283,5 +339,6 @@ __all__ = [
     "get_agent_descriptor",
     "validate_agent_id",
     "has_capability",
+    "normalize_agent_capabilities",
     "reload_agents",
 ]

@@ -8,7 +8,15 @@ from ...integrations.app_server.client import CodexAppServerResponseError
 from ...integrations.app_server.event_buffer import AppServerEventBuffer
 from ...integrations.app_server.supervisor import WorkspaceAppServerSupervisor
 from ..base import AgentHarness
-from ..types import AgentId, ConversationRef, ModelCatalog, ModelSpec, TurnRef
+from ..types import (
+    AgentId,
+    ConversationRef,
+    ModelCatalog,
+    ModelSpec,
+    RuntimeCapability,
+    TerminalTurnResult,
+    TurnRef,
+)
 
 _DEFAULT_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 _INVALID_PARAMS_ERROR_CODES = {-32600, -32602}
@@ -90,6 +98,18 @@ def _select_display_name(model_id: str, display_name_raw: Any) -> str:
 class CodexHarness(AgentHarness):
     agent_id: AgentId = AgentId("codex")
     display_name = "Codex"
+    capabilities = frozenset(
+        [
+            RuntimeCapability("durable_threads"),
+            RuntimeCapability("message_turns"),
+            RuntimeCapability("interrupt"),
+            RuntimeCapability("active_thread_discovery"),
+            RuntimeCapability("review"),
+            RuntimeCapability("model_listing"),
+            RuntimeCapability("event_streaming"),
+            RuntimeCapability("approvals"),
+        ]
+    )
 
     def __init__(
         self,
@@ -98,6 +118,7 @@ class CodexHarness(AgentHarness):
     ) -> None:
         self._supervisor = supervisor
         self._events = events
+        self._turn_handles: dict[tuple[str, str], Any] = {}
 
     async def ensure_ready(self, workspace_root: Path) -> None:
         await self._supervisor.get_client(workspace_root)
@@ -163,10 +184,15 @@ class CodexHarness(AgentHarness):
         self, workspace_root: Path, conversation_id: str
     ) -> ConversationRef:
         client = await self._supervisor.get_client(workspace_root)
-        result = await client.thread_resume(conversation_id)
-        thread_id = result.get("id") or conversation_id
-        if not isinstance(thread_id, str) or not thread_id:
-            thread_id = conversation_id
+        resume = getattr(client, "thread_resume", None)
+        if not callable(resume):
+            return ConversationRef(agent=self.agent_id, id=conversation_id)
+        result = await resume(conversation_id)
+        thread_id = conversation_id
+        if isinstance(result, dict):
+            candidate = result.get("id")
+            if isinstance(candidate, str) and candidate:
+                thread_id = candidate
         return ConversationRef(agent=self.agent_id, id=thread_id)
 
     async def start_turn(
@@ -179,6 +205,7 @@ class CodexHarness(AgentHarness):
         *,
         approval_mode: Optional[str],
         sandbox_policy: Optional[Any],
+        input_items: Optional[list[dict[str, Any]]] = None,
     ) -> TurnRef:
         client = await self._supervisor.get_client(workspace_root)
         turn_kwargs: dict[str, Any] = {}
@@ -189,12 +216,19 @@ class CodexHarness(AgentHarness):
         handle = await client.turn_start(
             conversation_id,
             prompt,
+            input_items=input_items,
             approval_policy=approval_mode,
             sandbox_policy=sandbox_policy,
             **turn_kwargs,
         )
-        await self._events.register_turn(handle.thread_id, handle.turn_id)
-        return TurnRef(conversation_id=handle.thread_id, turn_id=handle.turn_id)
+        resolved_thread_id = getattr(handle, "thread_id", conversation_id)
+        if not isinstance(resolved_thread_id, str) or not resolved_thread_id:
+            resolved_thread_id = conversation_id
+        self._turn_handles[(resolved_thread_id, handle.turn_id)] = handle
+        register_turn = getattr(self._events, "register_turn", None)
+        if callable(register_turn):
+            await register_turn(resolved_thread_id, handle.turn_id)
+        return TurnRef(conversation_id=resolved_thread_id, turn_id=handle.turn_id)
 
     async def start_review(
         self,
@@ -225,8 +259,14 @@ class CodexHarness(AgentHarness):
             sandbox_policy=sandbox_policy,
             **review_kwargs,
         )
-        await self._events.register_turn(handle.thread_id, handle.turn_id)
-        return TurnRef(conversation_id=handle.thread_id, turn_id=handle.turn_id)
+        resolved_thread_id = getattr(handle, "thread_id", conversation_id)
+        if not isinstance(resolved_thread_id, str) or not resolved_thread_id:
+            resolved_thread_id = conversation_id
+        self._turn_handles[(resolved_thread_id, handle.turn_id)] = handle
+        register_turn = getattr(self._events, "register_turn", None)
+        if callable(register_turn):
+            await register_turn(resolved_thread_id, handle.turn_id)
+        return TurnRef(conversation_id=resolved_thread_id, turn_id=handle.turn_id)
 
     async def interrupt(
         self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
@@ -240,6 +280,55 @@ class CodexHarness(AgentHarness):
         self, workspace_root: Path, conversation_id: str, turn_id: str
     ) -> AsyncIterator[str]:
         return self._events.stream(conversation_id, turn_id)
+
+    async def wait_for_turn(
+        self,
+        workspace_root: Path,
+        conversation_id: str,
+        turn_id: Optional[str],
+        *,
+        timeout: Optional[float] = None,
+    ) -> TerminalTurnResult:
+        _ = workspace_root
+        if not turn_id:
+            raise ValueError("turn_id is required")
+        handle = self._turn_handles.get((conversation_id, turn_id))
+        if handle is None:
+            raise KeyError(
+                f"Unknown Codex turn handle for thread={conversation_id} turn={turn_id}"
+            )
+        try:
+            result = await handle.wait(timeout=timeout)
+        finally:
+            self._turn_handles.pop((conversation_id, turn_id), None)
+        agent_messages = [
+            message.strip()
+            for message in getattr(result, "agent_messages", []) or []
+            if isinstance(message, str) and message.strip()
+        ]
+        assistant_text = "\n".join(agent_messages).strip()
+        if not assistant_text:
+            final_message = getattr(result, "final_message", "")
+            if isinstance(final_message, str):
+                assistant_text = final_message.strip()
+        return TerminalTurnResult(
+            status=(
+                str(result.status)
+                if getattr(result, "status", None) is not None
+                else None
+            ),
+            assistant_text=assistant_text,
+            errors=[
+                str(error)
+                for error in (getattr(result, "errors", []) or [])
+                if str(error).strip()
+            ],
+            raw_events=[
+                event
+                for event in (getattr(result, "raw_events", []) or [])
+                if isinstance(event, dict)
+            ],
+        )
 
 
 __all__ = ["CodexHarness"]

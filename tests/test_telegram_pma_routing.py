@@ -1,13 +1,16 @@
 import asyncio
+import contextlib
 import hashlib
 import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+import anyio
 import httpx
 import pytest
 
+from codex_autorunner.agents.registry import AgentDescriptor
 from codex_autorunner.core.app_server_threads import (
     PMA_KEY,
     PMA_OPENCODE_KEY,
@@ -22,8 +25,14 @@ from codex_autorunner.integrations.telegram.adapter import (
     TelegramPhotoSize,
     TelegramVoice,
 )
+from codex_autorunner.integrations.telegram.handlers import (
+    messages as telegram_messages_module,
+)
 from codex_autorunner.integrations.telegram.handlers.commands import (
     build_command_specs,
+)
+from codex_autorunner.integrations.telegram.handlers.commands import (
+    execution as execution_commands_module,
 )
 from codex_autorunner.integrations.telegram.handlers.commands import (
     workspace as workspace_commands_module,
@@ -237,6 +246,115 @@ async def test_pma_prompt_routing_preserves_native_input_items(tmp_path: Path) -
 
 
 @pytest.mark.anyio
+async def test_telegram_text_messages_route_through_orchestration_ingress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    class _RouterStub:
+        async def get_topic(self, _key: str) -> TelegramTopicRecord:
+            return TelegramTopicRecord(
+                workspace_path=str(workspace),
+                pma_enabled=False,
+                agent="codex",
+            )
+
+        def runtime_for(self, _key: str) -> object:
+            return SimpleNamespace()
+
+    class _HandlerStub:
+        def __init__(self) -> None:
+            self._router = _RouterStub()
+            self._logger = logging.getLogger("test")
+            self._config = SimpleNamespace(trigger_mode="all")
+            self._pending_questions = {}
+            self._resume_options = {}
+            self._bind_options = {}
+            self._flow_run_options = {}
+            self._agent_options = {}
+            self._model_options = {}
+            self._model_pending = {}
+            self._review_commit_options = {}
+            self._review_commit_subjects = {}
+            self._pending_review_custom = {}
+            self._ticket_flow_pause_targets = {}
+            self._bot_username = None
+            self._command_specs = {}
+
+        async def _resolve_topic_key(
+            self, chat_id: int, thread_id: Optional[int]
+        ) -> str:
+            return f"{chat_id}:{thread_id}"
+
+        def _get_paused_ticket_flow(
+            self, _workspace_root: Path, *, preferred_run_id: Optional[str]
+        ) -> Optional[tuple[str, object]]:
+            return None
+
+        def _enqueue_topic_work(self, _key: str, work):  # type: ignore[no-untyped-def]
+            asyncio.get_running_loop().create_task(work())
+
+        def _wrap_placeholder_work(self, **kwargs):  # type: ignore[no-untyped-def]
+            return kwargs["work"]
+
+        async def _send_message(self, *_args, **_kwargs) -> None:
+            return None
+
+        def _handle_pending_resume(self, *_args, **_kwargs) -> bool:
+            return False
+
+        def _handle_pending_bind(self, *_args, **_kwargs) -> bool:
+            return False
+
+        async def _handle_pending_review_commit(self, *_args, **_kwargs) -> bool:
+            return False
+
+        async def _handle_pending_review_custom(self, *_args, **_kwargs) -> bool:
+            return False
+
+        async def _dismiss_review_custom_prompt(self, *_args, **_kwargs) -> None:
+            return None
+
+    class _IngressStub:
+        async def submit_message(self, request, **kwargs):  # type: ignore[no-untyped-def]
+            captured["request"] = request
+            captured["callbacks"] = set(kwargs)
+            return SimpleNamespace(route="thread", thread_result=None)
+
+    monkeypatch.setattr(
+        telegram_messages_module,
+        "build_surface_orchestration_ingress",
+        lambda **_: _IngressStub(),
+    )
+
+    message = TelegramMessage(
+        update_id=1,
+        message_id=2,
+        chat_id=111,
+        thread_id=222,
+        from_user_id=333,
+        text="hello",
+        date=None,
+        is_topic_message=True,
+    )
+    await telegram_messages_module.handle_message_inner(_HandlerStub(), message)
+    await asyncio.sleep(0)
+
+    request = captured.get("request")
+    assert request is not None
+    assert request.surface_kind == "telegram"
+    assert request.prompt_text == "hello"
+    assert request.workspace_root == workspace
+    assert captured["callbacks"] == {
+        "resolve_paused_flow_target",
+        "submit_flow_reply",
+        "submit_thread_message",
+    }
+
+
+@pytest.mark.anyio
 async def test_pma_media_uses_hub_root(tmp_path: Path) -> None:
     hub_root = tmp_path / "hub"
     hub_root.mkdir(parents=True, exist_ok=True)
@@ -332,6 +450,94 @@ async def test_pma_media_uses_hub_root(tmp_path: Path) -> None:
     assert captured["workspace_path"] == str(hub_root)
     assert captured["caption"] == "please review"
     assert captured["kind"] == "file"
+
+
+@pytest.mark.anyio
+async def test_telegram_media_messages_route_through_orchestration_ingress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    class _RouterStub:
+        async def get_topic(self, _key: str) -> TelegramTopicRecord:
+            return TelegramTopicRecord(
+                workspace_path=str(workspace),
+                pma_enabled=False,
+                agent="codex",
+            )
+
+    class _HandlerStub:
+        def __init__(self) -> None:
+            self._router = _RouterStub()
+            self._logger = logging.getLogger("test")
+            self._config = SimpleNamespace(
+                media=SimpleNamespace(
+                    enabled=True,
+                    images=True,
+                    voice=True,
+                    files=True,
+                    max_image_bytes=10_000_000,
+                    max_voice_bytes=10_000_000,
+                    max_file_bytes=10_000_000,
+                )
+            )
+            self._ticket_flow_pause_targets = {}
+            self._bot_username = None
+
+        async def _resolve_topic_key(
+            self, chat_id: int, thread_id: Optional[int]
+        ) -> str:
+            return f"{chat_id}:{thread_id}"
+
+        def _get_paused_ticket_flow(
+            self, _workspace_root: Path, *, preferred_run_id: Optional[str]
+        ) -> Optional[tuple[str, object]]:
+            return None
+
+        async def _send_message(self, *_args, **_kwargs) -> None:
+            return None
+
+    class _IngressStub:
+        async def submit_message(self, request, **kwargs):  # type: ignore[no-untyped-def]
+            captured["request"] = request
+            captured["callbacks"] = set(kwargs)
+            return SimpleNamespace(route="thread", thread_result=None)
+
+    monkeypatch.setattr(
+        telegram_messages_module,
+        "build_surface_orchestration_ingress",
+        lambda **_: _IngressStub(),
+    )
+
+    message = TelegramMessage(
+        update_id=1,
+        message_id=2,
+        chat_id=111,
+        thread_id=222,
+        from_user_id=333,
+        text=None,
+        date=None,
+        is_topic_message=True,
+        document=TelegramDocument(
+            file_id="file-1",
+            file_unique_id=None,
+            file_name="notes.txt",
+            mime_type="text/plain",
+            file_size=10,
+        ),
+        caption="please review",
+    )
+    await handle_media_message(
+        _HandlerStub(), message, runtime=object(), caption_text="please review"
+    )
+
+    request = captured.get("request")
+    assert request is not None
+    assert request.surface_kind == "telegram"
+    assert request.prompt_text == "please review"
+    assert request.workspace_root == workspace
 
 
 @pytest.mark.anyio
@@ -517,6 +723,163 @@ async def test_pma_image_uses_hub_root(tmp_path: Path) -> None:
     assert captured["workspace_path"] == str(hub_root)
     assert captured["caption"] == "please inspect"
     assert captured["kind"] == "image"
+
+
+@pytest.mark.anyio
+async def test_message_routing_submits_thread_work_through_orchestration_ingress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = TelegramTopicRecord(
+        workspace_path=str(tmp_path / "workspace"),
+        pma_enabled=False,
+    )
+    Path(record.workspace_path or "").mkdir(parents=True, exist_ok=True)
+    captured: dict[str, object] = {}
+
+    class _Router:
+        async def get_topic(self, _key: str) -> TelegramTopicRecord:
+            return record
+
+        def runtime_for(self, _key: str) -> object:
+            return object()
+
+    class _Handler:
+        def __init__(self) -> None:
+            self._logger = logging.getLogger("test")
+            self._router = _Router()
+            self._bot_username = None
+            self._config = SimpleNamespace(trigger_mode="all")
+            self._pending_questions: dict[str, object] = {}
+            self._resume_options: dict[str, object] = {}
+            self._bind_options: dict[str, object] = {}
+            self._flow_run_options: dict[str, object] = {}
+            self._agent_options: dict[str, object] = {}
+            self._model_options: dict[str, object] = {}
+            self._model_pending: dict[str, object] = {}
+            self._review_commit_options: dict[str, object] = {}
+            self._review_commit_subjects: dict[str, object] = {}
+            self._pending_review_custom: dict[str, object] = {}
+            self._ticket_flow_pause_targets: dict[str, str] = {}
+            self._ticket_flow_bridge = SimpleNamespace(
+                auto_resume_run=lambda *args, **kwargs: None
+            )
+            self._command_specs: dict[str, object] = {}
+            self._last_task: Optional[asyncio.Task[None]] = None
+
+        async def _resolve_topic_key(
+            self, chat_id: int, thread_id: Optional[int]
+        ) -> str:
+            return f"{chat_id}:{thread_id}"
+
+        def _handle_pending_resume(
+            self, key: str, text: str, *, user_id: Optional[int]
+        ) -> bool:
+            _ = key, text, user_id
+            return False
+
+        def _handle_pending_bind(
+            self, key: str, text: str, *, user_id: Optional[int]
+        ) -> bool:
+            _ = key, text, user_id
+            return False
+
+        async def _handle_pending_review_commit(
+            self, message: TelegramMessage, runtime: object, key: str, text: str
+        ) -> bool:
+            _ = message, runtime, key, text
+            return False
+
+        async def _handle_pending_review_custom(
+            self,
+            key: str,
+            message: TelegramMessage,
+            runtime: object,
+            command: object,
+            raw_text: str,
+            raw_caption: str,
+        ) -> bool:
+            _ = key, message, runtime, command, raw_text, raw_caption
+            return False
+
+        async def _dismiss_review_custom_prompt(
+            self, message: TelegramMessage, pending: object
+        ) -> None:
+            _ = message, pending
+
+        def _get_paused_ticket_flow(
+            self, workspace_root: Path, *, preferred_run_id: Optional[str]
+        ) -> Optional[tuple[str, object]]:
+            _ = workspace_root, preferred_run_id
+            return None
+
+        async def _handle_normal_message(
+            self,
+            message: TelegramMessage,
+            runtime: object,
+            *,
+            text_override: Optional[str] = None,
+            placeholder_id: Optional[int] = None,
+        ) -> None:
+            _ = runtime, placeholder_id
+            captured["handled_text"] = text_override
+            captured["message_id"] = message.message_id
+
+        def _wrap_placeholder_work(
+            self,
+            *,
+            chat_id: int,
+            placeholder_id: Optional[int],
+            work: object,
+        ):
+            _ = chat_id, placeholder_id
+            return work
+
+        def _enqueue_topic_work(self, key: str, work: object) -> None:
+            _ = key
+            assert callable(work)
+            self._last_task = asyncio.create_task(work())
+
+    class _FakeIngress:
+        async def submit_message(
+            self,
+            request,
+            *,
+            resolve_paused_flow_target,
+            submit_flow_reply,
+            submit_thread_message,
+        ):
+            _ = resolve_paused_flow_target, submit_flow_reply
+            captured["surface_kind"] = request.surface_kind
+            captured["prompt_text"] = request.prompt_text
+            await submit_thread_message(request)
+            return SimpleNamespace(route="thread", thread_result=None)
+
+    monkeypatch.setattr(
+        telegram_messages_module,
+        "build_surface_orchestration_ingress",
+        lambda **_: _FakeIngress(),
+    )
+
+    handler = _Handler()
+    message = TelegramMessage(
+        update_id=1,
+        message_id=10,
+        chat_id=123,
+        thread_id=456,
+        from_user_id=789,
+        text="route through ingress",
+        date=None,
+        is_topic_message=True,
+    )
+
+    await telegram_messages_module.handle_message_inner(handler, message)
+    assert handler._last_task is not None
+    await handler._last_task
+
+    assert captured["surface_kind"] == "telegram"
+    assert captured["prompt_text"] == "route through ingress"
+    assert captured["handled_text"] == "route through ingress"
+    assert captured["message_id"] == 10
 
 
 class _TurnResult:
@@ -777,6 +1140,621 @@ class _PMAHandler(TelegramCommandHandlers):
 
     def _format_turn_metrics(self, *_args: object, **_kwargs: object) -> Optional[str]:
         return None
+
+
+class _ManagedThreadPMAHandler(_PMAHandler):
+    def __init__(
+        self,
+        record: TelegramTopicRecord,
+        hub_root: Path,
+    ) -> None:
+        super().__init__(
+            record,
+            client=_PMAClientStub(),
+            hub_root=hub_root,
+            registry=AppServerThreadRegistry(hub_root / "threads.json"),
+        )
+        self._config = SimpleNamespace(
+            root=hub_root,
+            concurrency=SimpleNamespace(max_parallel_turns=1, per_topic_queue=False),
+            agent_turn_timeout_seconds={"codex": None, "opencode": None},
+            metrics_mode="separate",
+        )
+        self._sent: list[str] = []
+        self._spawned_tasks: set[asyncio.Task[object]] = set()
+
+    async def _send_message(
+        self,
+        _chat_id: int,
+        text: str,
+        *,
+        thread_id: Optional[int],
+        reply_to: Optional[int],
+    ) -> None:
+        _ = thread_id, reply_to
+        self._sent.append(text)
+
+    async def _deliver_turn_response(
+        self,
+        *,
+        chat_id: int,
+        thread_id: Optional[int],
+        reply_to: Optional[int],
+        placeholder_id: Optional[int],
+        response: str,
+        delete_placeholder_on_delivery: bool = True,
+    ) -> bool:
+        _ = (
+            chat_id,
+            thread_id,
+            reply_to,
+            placeholder_id,
+            delete_placeholder_on_delivery,
+        )
+        self._sent.append(response)
+        return True
+
+    async def _flush_outbox_files(
+        self,
+        _record: TelegramTopicRecord,
+        *,
+        chat_id: int,
+        thread_id: Optional[int],
+        reply_to: Optional[int],
+    ) -> None:
+        _ = chat_id, thread_id, reply_to
+        return None
+
+    def _format_turn_metrics_text(
+        self,
+        token_usage: Optional[dict[str, Any]],
+        elapsed_seconds: Optional[float],
+    ) -> Optional[str]:
+        _ = token_usage, elapsed_seconds
+        return None
+
+    def _metrics_mode(self) -> str:
+        return "separate"
+
+    def _spawn_task(self, coro):  # type: ignore[no-untyped-def]
+        task = asyncio.create_task(coro)
+        self._spawned_tasks.add(task)
+        task.add_done_callback(self._spawned_tasks.discard)
+        return task
+
+
+@pytest.mark.anyio
+async def test_pma_text_messages_route_repeated_messages_through_managed_thread_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = TelegramTopicRecord(
+        pma_enabled=True,
+        workspace_path=None,
+        repo_id="repo-1",
+        agent="codex",
+    )
+    handler = _ManagedThreadPMAHandler(record, tmp_path)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class _FakeHarness:
+        display_name = "Fake"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+            }
+        )
+
+        def __init__(self) -> None:
+            self.turn_prompts: list[str] = []
+            self.waited_turns: list[str] = []
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="telegram-backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            _ = workspace_root
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                conversation_id,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+                input_items,
+            )
+            turn_id = f"telegram-backend-turn-{len(self.turn_prompts) + 1}"
+            self.turn_prompts.append(prompt)
+            return SimpleNamespace(conversation_id=conversation_id, turn_id=turn_id)
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, conversation_id, timeout
+            assert isinstance(turn_id, str)
+            self.waited_turns.append(turn_id)
+            if turn_id == "telegram-backend-turn-1":
+                first_started.set()
+                await release_first.wait()
+                return SimpleNamespace(
+                    status="ok",
+                    assistant_text="first telegram orchestration reply",
+                    errors=[],
+                )
+            return SimpleNamespace(
+                status="ok",
+                assistant_text="second telegram orchestration reply",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            _ = workspace_root, conversation_id, turn_id
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            if False:
+                yield ""
+
+    harness = _FakeHarness()
+    monkeypatch.setattr(
+        execution_commands_module,
+        "get_registered_agents",
+        lambda: {
+            "codex": AgentDescriptor(
+                id="codex",
+                name="Codex",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    first_message = TelegramMessage(
+        update_id=1,
+        message_id=10,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="first orchestration prompt",
+        date=None,
+        is_topic_message=True,
+    )
+    second_message = TelegramMessage(
+        update_id=2,
+        message_id=11,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="second orchestration prompt",
+        date=None,
+        is_topic_message=True,
+    )
+
+    first_task = asyncio.create_task(
+        handler._handle_normal_message(first_message, runtime=_RuntimeStub())
+    )
+    try:
+        await first_started.wait()
+        await handler._handle_normal_message(second_message, runtime=_RuntimeStub())
+        release_first.set()
+        await first_task
+        with anyio.fail_after(2):
+            while "second telegram orchestration reply" not in handler._sent:
+                await anyio.sleep(0.05)
+
+        assert "Queued (waiting for available worker...)" in handler._sent
+        assert "first telegram orchestration reply" in handler._sent
+        assert "second telegram orchestration reply" in handler._sent
+
+        thread_store = execution_commands_module.PmaThreadStore(tmp_path)
+        threads = thread_store.list_threads(limit=10)
+        assert len(threads) == 1
+        turns = thread_store.list_turns(threads[0]["managed_thread_id"], limit=10)
+        assert len(turns) == 2
+        assert [turn["status"] for turn in turns] == ["ok", "ok"]
+    finally:
+        release_first.set()
+        if not first_task.done():
+            first_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first_task
+        remaining_tasks = list(handler._spawned_tasks)
+        for task in remaining_tasks:
+            if not task.done():
+                task.cancel()
+        for task in remaining_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.anyio
+async def test_pma_native_input_items_route_through_managed_thread_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = TelegramTopicRecord(
+        pma_enabled=True,
+        workspace_path=None,
+        repo_id="repo-1",
+        agent="codex",
+    )
+    handler = _ManagedThreadPMAHandler(record, tmp_path)
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(b"png-bytes")
+    captured_input_items: list[Optional[list[dict[str, Any]]]] = []
+
+    class _FakeHarness:
+        display_name = "Fake"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+            }
+        )
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="telegram-backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            _ = workspace_root
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                conversation_id,
+                prompt,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+            )
+            captured_input_items.append(input_items)
+            return SimpleNamespace(
+                conversation_id=conversation_id,
+                turn_id="telegram-backend-turn-1",
+            )
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, conversation_id, turn_id, timeout
+            return SimpleNamespace(
+                status="ok",
+                assistant_text="telegram managed attachment reply",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            _ = workspace_root, conversation_id, turn_id
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            if False:
+                yield ""
+
+    harness = _FakeHarness()
+    monkeypatch.setattr(
+        execution_commands_module,
+        "get_registered_agents",
+        lambda: {
+            "codex": AgentDescriptor(
+                id="codex",
+                name="Codex",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    message = TelegramMessage(
+        update_id=1,
+        message_id=10,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="review this image",
+        date=None,
+        is_topic_message=True,
+    )
+    input_items = [
+        {"type": "text", "text": "review this image"},
+        {"type": "localImage", "path": str(image_path)},
+    ]
+
+    await handler._handle_normal_message(
+        message,
+        runtime=_RuntimeStub(),
+        input_items=input_items,
+    )
+
+    assert captured_input_items and isinstance(captured_input_items[0], list)
+    items = captured_input_items[0] or []
+    assert items and items[0].get("type") == "text"
+    assert "<user_message>" in str(items[0].get("text") or "")
+    assert any(item.get("type") == "localImage" for item in items[1:])
+    assert "telegram managed attachment reply" in handler._sent
+
+    thread_store = execution_commands_module.PmaThreadStore(tmp_path)
+    threads = thread_store.list_threads(limit=10)
+    assert len(threads) == 1
+    turns = thread_store.list_turns(threads[0]["managed_thread_id"], limit=10)
+    assert len(turns) == 1
+    assert turns[0]["status"] == "ok"
+
+
+@pytest.mark.anyio
+async def test_pma_interrupt_uses_managed_thread_orchestration_for_text_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = TelegramTopicRecord(
+        pma_enabled=True,
+        workspace_path=None,
+        repo_id="repo-1",
+        agent="codex",
+    )
+    handler = _ManagedThreadPMAHandler(record, tmp_path)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class _FakeHarness:
+        display_name = "Fake"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+            }
+        )
+
+        def __init__(self) -> None:
+            self.interrupt_calls: list[tuple[Path, str, Optional[str]]] = []
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="telegram-backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            _ = workspace_root
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                conversation_id,
+                prompt,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+                input_items,
+            )
+            turn_id = "telegram-backend-turn-1"
+            if release_first.is_set():
+                turn_id = "telegram-backend-turn-2"
+            return SimpleNamespace(conversation_id=conversation_id, turn_id=turn_id)
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, conversation_id, timeout
+            assert isinstance(turn_id, str)
+            if turn_id == "telegram-backend-turn-1":
+                first_started.set()
+                await release_first.wait()
+                return SimpleNamespace(
+                    status="interrupted",
+                    assistant_text="",
+                    errors=[],
+                )
+            return SimpleNamespace(
+                status="ok",
+                assistant_text="unexpected queued reply",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            self.interrupt_calls.append((workspace_root, conversation_id, turn_id))
+            release_first.set()
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            if False:
+                yield ""
+
+    harness = _FakeHarness()
+    monkeypatch.setattr(
+        execution_commands_module,
+        "get_registered_agents",
+        lambda: {
+            "codex": AgentDescriptor(
+                id="codex",
+                name="Codex",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    message = TelegramMessage(
+        update_id=1,
+        message_id=10,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="interruptible orchestration prompt",
+        date=None,
+        is_topic_message=True,
+    )
+    queued_message = TelegramMessage(
+        update_id=2,
+        message_id=11,
+        chat_id=-1001,
+        thread_id=101,
+        from_user_id=42,
+        text="queued orchestration prompt",
+        date=None,
+        is_topic_message=True,
+    )
+
+    first_task = asyncio.create_task(
+        handler._handle_normal_message(message, runtime=_RuntimeStub())
+    )
+    try:
+        await first_started.wait()
+        await handler._handle_normal_message(queued_message, runtime=_RuntimeStub())
+        await handler._process_interrupt(
+            chat_id=message.chat_id,
+            thread_id=message.thread_id,
+            reply_to=message.message_id,
+            runtime=_RuntimeStub(),
+            message_id=99,
+        )
+        with anyio.fail_after(2):
+            while (
+                "Interrupted active PMA turn. Cancelled 1 queued PMA turn(s)."
+                not in handler._sent
+            ):
+                await anyio.sleep(0.05)
+        await first_task
+
+        assert harness.interrupt_calls == [
+            (tmp_path, "telegram-backend-thread-1", "telegram-backend-turn-1")
+        ]
+        assert (
+            "Interrupted active PMA turn. Cancelled 1 queued PMA turn(s)."
+            in handler._sent
+        )
+        assert "unexpected queued reply" not in handler._sent
+
+        thread_store = execution_commands_module.PmaThreadStore(tmp_path)
+        threads = thread_store.list_threads(limit=10)
+        assert len(threads) == 1
+        turns = thread_store.list_turns(threads[0]["managed_thread_id"], limit=10)
+        assert len(turns) == 2
+        assert [turn["status"] for turn in turns] == ["interrupted", "interrupted"]
+    finally:
+        release_first.set()
+        if not first_task.done():
+            first_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first_task
+        remaining_tasks = list(handler._spawned_tasks)
+        for task in remaining_tasks:
+            if not task.done():
+                task.cancel()
+        for task in remaining_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 @pytest.mark.anyio

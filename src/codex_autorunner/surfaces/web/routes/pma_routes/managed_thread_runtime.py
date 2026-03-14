@@ -3,14 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .....core.config import PMA_DEFAULT_MAX_TEXT_CHARS
+from .....core.orchestration import MessageRequest
+from .....core.orchestration.runtime_threads import (
+    RUNTIME_THREAD_INTERRUPTED_ERROR,
+    RUNTIME_THREAD_TIMEOUT_ERROR,
+    RuntimeThreadExecution,
+    RuntimeThreadOutcome,
+    await_runtime_thread_outcome,
+    begin_next_queued_runtime_thread_execution,
+    begin_runtime_thread_execution,
+)
 from .....core.pma_context import format_pma_discoverability_preamble
 from .....core.pma_thread_store import (
     ManagedThreadAlreadyHasRunningTurnError,
@@ -25,6 +33,9 @@ from .automation_adapter import (
     get_automation_store,
     normalize_optional_text,
 )
+from .managed_threads import (
+    build_managed_thread_orchestration_service as _shared_managed_thread_orchestration_service,
+)
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -35,7 +46,13 @@ MANAGED_THREAD_PUBLIC_EXECUTION_ERROR = "Managed thread execution failed"
 MANAGED_THREAD_PUBLIC_INTERRUPT_ERROR = "Failed to interrupt backend turn"
 PMA_TIMEOUT_SECONDS = 7200
 PMA_MAX_TEXT = PMA_DEFAULT_MAX_TEXT_CHARS
-_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _build_managed_thread_orchestration_service(
+    request: Request, *, thread_store: Optional[PmaThreadStore] = None
+):
+    _ = thread_store
+    return _shared_managed_thread_orchestration_service(request)
 
 
 def _truncate_text(value: Any, limit: int) -> str:
@@ -45,12 +62,6 @@ def _truncate_text(value: Any, limit: int) -> str:
     if len(s) <= limit:
         return s
     return s[: limit - 3] + "..."
-
-
-def _is_within_root(path: Path, root: Path) -> bool:
-    from .....core.state_roots import is_within_allowed_root
-
-    return is_within_allowed_root(path, allowed_roots=[root], resolve=True)
 
 
 def _compose_compacted_prompt(compact_seed: str, message: str) -> str:
@@ -64,37 +75,26 @@ def _compose_compacted_prompt(compact_seed: str, message: str) -> str:
 
 def _sanitize_managed_thread_result_error(detail: Any) -> str:
     sanitized = normalize_optional_text(detail)
+    if sanitized in {RUNTIME_THREAD_TIMEOUT_ERROR, "PMA chat timed out"}:
+        return "PMA chat timed out"
+    if sanitized in {RUNTIME_THREAD_INTERRUPTED_ERROR, "PMA chat interrupted"}:
+        return "PMA chat interrupted"
     if sanitized in {"PMA chat timed out", "PMA chat interrupted"}:
         return sanitized
     return MANAGED_THREAD_PUBLIC_EXECUTION_ERROR
 
 
-def _normalize_workspace_root_input(workspace_root: str) -> Any:
-    # Uses PurePosixPath from pathlib at top of file
-
-    cleaned = (workspace_root or "").strip()
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="workspace_root is invalid")
-    if "\\" in cleaned or "\x00" in cleaned or _DRIVE_PREFIX_RE.match(cleaned):
-        raise HTTPException(status_code=400, detail="workspace_root is invalid")
-    normalized = PurePosixPath(cleaned)
-    if ".." in normalized.parts:
-        raise HTTPException(status_code=400, detail="workspace_root is invalid")
-    return normalized
-
-
-def _resolve_managed_thread_workspace(hub_root: Path, workspace_root: Any) -> Path:
-    raw_workspace = normalize_optional_text(workspace_root)
-    if raw_workspace is None:
+def _normalize_busy_policy(value: Any) -> str:
+    normalized = normalize_optional_text(value)
+    if normalized is None:
+        return "queue"
+    busy_policy = normalized.lower()
+    if busy_policy not in {"queue", "interrupt", "reject"}:
         raise HTTPException(
-            status_code=500, detail="Managed thread has invalid workspace_root"
+            status_code=400,
+            detail="busy_policy must be one of: queue, interrupt, reject",
         )
-    resolved_workspace = Path(raw_workspace).absolute()
-    if not _is_within_root(resolved_workspace, hub_root):
-        raise HTTPException(
-            status_code=400, detail="Managed thread workspace_root is invalid"
-        )
-    return resolved_workspace
+    return busy_policy
 
 
 async def notify_managed_thread_terminal_transition(
@@ -299,267 +299,6 @@ def build_managed_thread_runtime_routes(
             return defaults
         return {**defaults, **pma}
 
-    async def _execute_app_server(
-        supervisor: Any,
-        events: Any,
-        hub_root: Path,
-        prompt: str,
-        interrupt_event: asyncio.Event,
-        *,
-        model: Optional[str] = None,
-        reasoning: Optional[str] = None,
-        backend_thread_id: Optional[str] = None,
-        thread_registry: Optional[Any] = None,
-        thread_key: Optional[str] = None,
-        on_meta: Optional[Any] = None,
-    ) -> dict[str, Any]:
-        from .....agents.codex.harness import CodexHarness
-
-        client = await supervisor.get_client(hub_root)
-
-        if backend_thread_id:
-            thread_id = backend_thread_id
-        elif thread_registry is not None and thread_key:
-            thread_id = thread_registry.get_thread_id(thread_key)
-        else:
-            thread_id = None
-        if thread_id:
-            try:
-                await client.thread_resume(thread_id)
-            except Exception:
-                thread_id = None
-
-        if not thread_id:
-            thread = await client.thread_start(str(hub_root))
-            thread_id = thread.get("id")
-            if not isinstance(thread_id, str) or not thread_id:
-                raise HTTPException(
-                    status_code=502, detail="App-server did not return a thread id"
-                )
-            if thread_registry is not None and thread_key:
-                thread_registry.set_thread_id(thread_key, thread_id)
-
-        turn_kwargs: dict[str, Any] = {}
-        if model:
-            turn_kwargs["model"] = model
-        if reasoning:
-            turn_kwargs["effort"] = reasoning
-
-        handle = await client.turn_start(
-            thread_id,
-            prompt,
-            approval_policy="on-request",
-            sandbox_policy="dangerFullAccess",
-            **turn_kwargs,
-        )
-        codex_harness = CodexHarness(supervisor, events)
-        if on_meta is not None:
-            try:
-                maybe = on_meta(thread_id, handle.turn_id)
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            except Exception:
-                logger.exception("pma meta callback failed")
-
-        if interrupt_event.is_set():
-            try:
-                await codex_harness.interrupt(hub_root, thread_id, handle.turn_id)
-            except Exception:
-                logger.exception("Failed to interrupt Codex turn")
-            return {"status": "interrupted", "detail": "PMA chat interrupted"}
-
-        turn_task = asyncio.create_task(handle.wait(timeout=None))
-        timeout_task = asyncio.create_task(asyncio.sleep(PMA_TIMEOUT_SECONDS))
-        interrupt_task = asyncio.create_task(interrupt_event.wait())
-
-        runtime_state = get_runtime_state()
-
-        try:
-            done, _ = await asyncio.wait(
-                {turn_task, timeout_task, interrupt_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if timeout_task in done:
-                try:
-                    await codex_harness.interrupt(hub_root, thread_id, handle.turn_id)
-                except Exception:
-                    logger.exception("Failed to interrupt Codex turn")
-                runtime_state.cancel_background_task(
-                    turn_task, name="pma.app_server.turn.wait"
-                )
-                return {"status": "error", "detail": "PMA chat timed out"}
-            if interrupt_task in done:
-                try:
-                    await codex_harness.interrupt(hub_root, thread_id, handle.turn_id)
-                except Exception:
-                    logger.exception("Failed to interrupt Codex turn")
-                runtime_state.cancel_background_task(
-                    turn_task, name="pma.app_server.turn.wait"
-                )
-                return {"status": "interrupted", "detail": "PMA chat interrupted"}
-            turn_result = await turn_task
-        finally:
-            runtime_state.cancel_background_task(
-                timeout_task, name="pma.app_server.timeout.wait"
-            )
-            runtime_state.cancel_background_task(
-                interrupt_task, name="pma.app_server.interrupt.wait"
-            )
-
-        if getattr(turn_result, "errors", None):
-            errors = turn_result.errors
-            raise HTTPException(status_code=502, detail=errors[-1] if errors else "")
-
-        output = "\n".join(getattr(turn_result, "agent_messages", []) or []).strip()
-        raw_events = getattr(turn_result, "raw_events", []) or []
-        return {
-            "status": "ok",
-            "message": output,
-            "thread_id": thread_id,
-            "backend_thread_id": thread_id,
-            "turn_id": handle.turn_id,
-            "raw_events": raw_events,
-        }
-
-    async def _execute_opencode(
-        supervisor: Any,
-        hub_root: Path,
-        prompt: str,
-        interrupt_event: asyncio.Event,
-        *,
-        model: Optional[str] = None,
-        reasoning: Optional[str] = None,
-        backend_session_id: Optional[str] = None,
-        thread_registry: Optional[Any] = None,
-        thread_key: Optional[str] = None,
-        stall_timeout_seconds: Optional[float] = None,
-        on_meta: Optional[Any] = None,
-    ) -> dict[str, Any]:
-        from .....agents.opencode.harness import OpenCodeHarness
-        from .....agents.opencode.runtime import (
-            PERMISSION_ALLOW,
-            build_turn_id,
-            collect_opencode_output,
-            extract_session_id,
-            parse_message_response,
-            split_model_id,
-        )
-
-        client = await supervisor.get_client(hub_root)
-        session_id = backend_session_id
-        if session_id is None and thread_registry is not None and thread_key:
-            session_id = thread_registry.get_thread_id(thread_key)
-        if not session_id:
-            session = await client.create_session(directory=str(hub_root))
-            session_id = extract_session_id(session, allow_fallback_id=True)
-            if not isinstance(session_id, str) or not session_id:
-                raise HTTPException(
-                    status_code=502, detail="OpenCode did not return a session id"
-                )
-            if thread_registry is not None and thread_key:
-                thread_registry.set_thread_id(thread_key, session_id)
-        if on_meta is not None:
-            try:
-                maybe = on_meta(session_id, build_turn_id(session_id))
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            except Exception:
-                logger.exception("pma meta callback failed")
-
-        opencode_harness = OpenCodeHarness(supervisor)
-        if interrupt_event.is_set():
-            await opencode_harness.interrupt(hub_root, session_id, None)
-            return {"status": "interrupted", "detail": "PMA chat interrupted"}
-
-        model_payload = split_model_id(model)
-        await supervisor.mark_turn_started(hub_root)
-
-        ready_event = asyncio.Event()
-        output_task = asyncio.create_task(
-            collect_opencode_output(
-                client,
-                session_id=session_id,
-                workspace_path=str(hub_root),
-                model_payload=model_payload,
-                permission_policy=PERMISSION_ALLOW,
-                question_policy="auto_first_option",
-                should_stop=interrupt_event.is_set,
-                ready_event=ready_event,
-                stall_timeout_seconds=stall_timeout_seconds,
-            )
-        )
-        try:
-            await asyncio.wait_for(ready_event.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
-
-        prompt_task = asyncio.create_task(
-            client.prompt_async(
-                session_id,
-                message=prompt,
-                model=model_payload,
-                variant=reasoning,
-            )
-        )
-        timeout_task = asyncio.create_task(asyncio.sleep(PMA_TIMEOUT_SECONDS))
-        interrupt_task = asyncio.create_task(interrupt_event.wait())
-
-        runtime_state = get_runtime_state()
-
-        try:
-            prompt_response = None
-            try:
-                prompt_response = await prompt_task
-            except Exception as exc:
-                interrupt_event.set()
-                runtime_state.cancel_background_task(
-                    output_task, name="pma.opencode.output.collect"
-                )
-                await opencode_harness.interrupt(hub_root, session_id, None)
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-            done, _ = await asyncio.wait(
-                {output_task, timeout_task, interrupt_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if timeout_task in done:
-                runtime_state.cancel_background_task(
-                    output_task, name="pma.opencode.output.collect"
-                )
-                await opencode_harness.interrupt(hub_root, session_id, None)
-                return {"status": "error", "detail": "PMA chat timed out"}
-            if interrupt_task in done:
-                runtime_state.cancel_background_task(
-                    output_task, name="pma.opencode.output.collect"
-                )
-                await opencode_harness.interrupt(hub_root, session_id, None)
-                return {"status": "interrupted", "detail": "PMA chat interrupted"}
-            output_result = await output_task
-            if (not output_result.text) and prompt_response is not None:
-                fallback = parse_message_response(prompt_response)
-                if fallback.text:
-                    output_result = type(output_result)(
-                        text=fallback.text, error=fallback.error
-                    )
-        finally:
-            runtime_state.cancel_background_task(
-                timeout_task, name="pma.opencode.timeout.wait"
-            )
-            runtime_state.cancel_background_task(
-                interrupt_task, name="pma.opencode.interrupt.wait"
-            )
-            await supervisor.mark_turn_finished(hub_root)
-
-        if output_result.error:
-            raise HTTPException(status_code=502, detail=output_result.error)
-        return {
-            "status": "ok",
-            "message": output_result.text,
-            "thread_id": session_id,
-            "backend_thread_id": session_id,
-            "turn_id": build_turn_id(session_id),
-        }
-
     @router.post("/threads/{managed_thread_id}/messages")
     async def send_managed_thread_message(
         managed_thread_id: str,
@@ -567,6 +306,7 @@ def build_managed_thread_runtime_routes(
         payload: PmaManagedThreadMessageRequest,
     ) -> Any:
         parsed = payload.model_dump(exclude_none=True)
+        busy_policy = _normalize_busy_policy(parsed.get("busy_policy"))
 
         message = (parsed.get("message") or "").strip()
         if not message:
@@ -626,7 +366,6 @@ def build_managed_thread_runtime_routes(
             "reasoning"
         )
         stored_backend_id = normalize_optional_text(thread.get("backend_thread_id"))
-        known_backend_thread_id = stored_backend_id
         compact_seed = normalize_optional_text(thread.get("compact_seed"))
         execution_message = message
         if not stored_backend_id and compact_seed:
@@ -637,12 +376,29 @@ def build_managed_thread_runtime_routes(
             f"{execution_message}\n"
             "</user_message>\n"
         )
+        service = _build_managed_thread_orchestration_service(
+            request,
+            thread_store=thread_store,
+        )
         try:
-            turn = thread_store.create_turn(
-                managed_thread_id,
-                prompt=message,
-                model=model,
-                reasoning=reasoning,
+            started_execution = await begin_runtime_thread_execution(
+                service,
+                MessageRequest(
+                    target_id=managed_thread_id,
+                    target_kind="thread",
+                    message_text=message,
+                    busy_policy=busy_policy,
+                    model=model,
+                    reasoning=reasoning,
+                    approval_mode="on-request",
+                    metadata={
+                        "runtime_prompt": execution_prompt,
+                        "execution_error_message": (
+                            MANAGED_THREAD_PUBLIC_EXECUTION_ERROR
+                        ),
+                    },
+                ),
+                sandbox_policy="dangerFullAccess",
             )
         except ManagedThreadNotActiveError as exc:
             if exc.status == "archived":
@@ -659,7 +415,7 @@ def build_managed_thread_runtime_routes(
                     "next_step": "Resume the thread or create a new active thread.",
                     "managed_thread_id": managed_thread_id,
                     "managed_turn_id": None,
-                    "backend_thread_id": known_backend_thread_id or "",
+                    "backend_thread_id": stored_backend_id or "",
                     "assistant_text": "",
                     "error": detail,
                 },
@@ -684,14 +440,59 @@ def build_managed_thread_runtime_routes(
                         (running_turn or {}).get("managed_turn_id") or ""
                     )
                     or None,
-                    "backend_thread_id": known_backend_thread_id or "",
+                    "backend_thread_id": stored_backend_id or "",
                     "assistant_text": "",
                     "error": "Managed thread already has a running turn",
                 },
             )
-        managed_turn_id = str(turn.get("managed_turn_id") or "")
+        except Exception:
+            logger.exception(
+                "Managed thread execution setup failed (managed_thread_id=%s)",
+                managed_thread_id,
+            )
+            return {
+                "status": "error",
+                "send_state": "accepted",
+                "execution_state": "completed",
+                "managed_thread_id": managed_thread_id,
+                "managed_turn_id": None,
+                "backend_thread_id": stored_backend_id or "",
+                "assistant_text": "",
+                "error": MANAGED_THREAD_PUBLIC_EXECUTION_ERROR,
+            }
+        managed_turn_id = started_execution.execution.execution_id
         if not managed_turn_id:
             raise HTTPException(status_code=500, detail="Failed to create managed turn")
+        backend_thread_id = (
+            normalize_optional_text(started_execution.thread.backend_thread_id)
+            or stored_backend_id
+            or ""
+        )
+        execution_status = str(
+            getattr(started_execution.execution, "status", "running") or "running"
+        ).strip()
+        if execution_status not in {"running", "queued"}:
+            detail = _sanitize_managed_thread_result_error(
+                started_execution.execution.error
+            )
+            await notify_managed_thread_terminal_transition(
+                request,
+                thread=thread,
+                managed_thread_id=managed_thread_id,
+                managed_turn_id=managed_turn_id,
+                to_state="failed",
+                reason=detail,
+            )
+            return {
+                "status": "error",
+                "send_state": "accepted",
+                "execution_state": "completed",
+                "managed_thread_id": managed_thread_id,
+                "managed_turn_id": managed_turn_id,
+                "backend_thread_id": backend_thread_id or "",
+                "assistant_text": "",
+                "error": detail,
+            }
 
         notification: Optional[dict[str, Any]] = None
         if notify_on == "terminal":
@@ -707,219 +508,269 @@ def build_managed_thread_runtime_routes(
                 ),
             )
 
-        preview = _truncate_text(message, 120)
-        workspace_root = _resolve_managed_thread_workspace(
-            hub_root, thread.get("workspace_root")
-        )
-        agent = str(thread.get("agent") or "").strip().lower()
-        interrupt_event = asyncio.Event()
+        def _managed_thread_task_pool() -> set[asyncio.Task[Any]]:
+            task_pool = getattr(request.app.state, "pma_managed_thread_tasks", None)
+            if not isinstance(task_pool, set):
+                task_pool = set()
+                request.app.state.pma_managed_thread_tasks = task_pool
+            return task_pool
 
-        async def _finalize_error(
-            detail: str, *, backend_turn_id: Optional[str] = None
-        ) -> dict[str, Any]:
-            thread_store.mark_turn_finished(
-                managed_turn_id,
-                status="error",
-                assistant_text="",
-                error=detail,
-                backend_turn_id=backend_turn_id,
-                transcript_turn_id=None,
+        def _track_task(task: asyncio.Task[Any]) -> None:
+            task_pool = _managed_thread_task_pool()
+            task_pool.add(task)
+            task.add_done_callback(lambda done: task_pool.discard(done))
+
+        async def _run_execution(started: RuntimeThreadExecution) -> dict[str, Any]:
+            current_turn_id = started.execution.execution_id
+            current_preview = _truncate_text(started.request.message_text, 120)
+            current_thread_row = thread_store.get_thread(managed_thread_id) or thread
+            current_backend_thread_id = (
+                normalize_optional_text(started.thread.backend_thread_id)
+                or stored_backend_id
+                or ""
             )
+            try:
+                outcome = await await_runtime_thread_outcome(
+                    started,
+                    interrupt_event=None,
+                    timeout_seconds=PMA_TIMEOUT_SECONDS,
+                    execution_error_message=MANAGED_THREAD_PUBLIC_EXECUTION_ERROR,
+                )
+            except Exception:
+                logger.exception(
+                    "Managed thread execution raised unexpected error (managed_thread_id=%s, managed_turn_id=%s)",
+                    managed_thread_id,
+                    current_turn_id,
+                )
+                outcome = RuntimeThreadOutcome(
+                    status="error",
+                    assistant_text="",
+                    error=MANAGED_THREAD_PUBLIC_EXECUTION_ERROR,
+                    backend_thread_id=current_backend_thread_id,
+                    backend_turn_id=started.execution.backend_id,
+                )
+
+            finalized_thread = service.get_thread_target(managed_thread_id)
+            resolved_backend_thread_id = (
+                normalize_optional_text(
+                    finalized_thread.backend_thread_id if finalized_thread else None
+                )
+                or outcome.backend_thread_id
+                or backend_thread_id
+            )
+            if outcome.status == "ok":
+                transcript_metadata = {
+                    "managed_thread_id": managed_thread_id,
+                    "managed_turn_id": current_turn_id,
+                    "repo_id": current_thread_row.get("repo_id"),
+                    "workspace_root": str(started.workspace_root),
+                    "agent": current_thread_row.get("agent"),
+                    "backend_thread_id": resolved_backend_thread_id,
+                    "backend_turn_id": outcome.backend_turn_id,
+                    "model": started.request.model,
+                    "reasoning": started.request.reasoning,
+                    "status": "ok",
+                }
+                transcript_turn_id: Optional[str] = None
+                try:
+                    transcripts.write_transcript(
+                        turn_id=current_turn_id,
+                        metadata=transcript_metadata,
+                        assistant_text=outcome.assistant_text,
+                    )
+                    transcript_turn_id = current_turn_id
+                except Exception:
+                    logger.exception(
+                        "Failed to persist managed-thread transcript (managed_thread_id=%s, managed_turn_id=%s)",
+                        managed_thread_id,
+                        current_turn_id,
+                    )
+
+                try:
+                    finalized_execution = service.record_execution_result(
+                        managed_thread_id,
+                        current_turn_id,
+                        status="ok",
+                        assistant_text=outcome.assistant_text,
+                        error=None,
+                        backend_turn_id=outcome.backend_turn_id,
+                        transcript_turn_id=transcript_turn_id,
+                    )
+                except KeyError:
+                    finalized_execution = service.get_execution(
+                        managed_thread_id, current_turn_id
+                    )
+                finalized_status = str(
+                    (finalized_execution.status if finalized_execution else "")
+                ).strip()
+                if finalized_status != "ok":
+                    detail = MANAGED_THREAD_PUBLIC_EXECUTION_ERROR
+                    response_status = "error"
+                    if finalized_status == "interrupted":
+                        detail = "PMA chat interrupted"
+                        response_status = "interrupted"
+                    elif (
+                        finalized_status == "error" and finalized_execution is not None
+                    ):
+                        detail = _sanitize_managed_thread_result_error(
+                            finalized_execution.error
+                        )
+                    await notify_managed_thread_terminal_transition(
+                        request,
+                        thread=current_thread_row,
+                        managed_thread_id=managed_thread_id,
+                        managed_turn_id=current_turn_id,
+                        to_state="failed",
+                        reason=detail,
+                    )
+                    return {
+                        "status": response_status,
+                        "managed_thread_id": managed_thread_id,
+                        "managed_turn_id": current_turn_id,
+                        "backend_thread_id": resolved_backend_thread_id or "",
+                        "assistant_text": "",
+                        "error": detail,
+                    }
+                thread_store.update_thread_after_turn(
+                    managed_thread_id,
+                    last_turn_id=current_turn_id,
+                    last_message_preview=current_preview,
+                )
+                await notify_managed_thread_terminal_transition(
+                    request,
+                    thread=current_thread_row,
+                    managed_thread_id=managed_thread_id,
+                    managed_turn_id=current_turn_id,
+                    to_state="completed",
+                    reason="managed_turn_completed",
+                )
+                return {
+                    "status": "ok",
+                    "managed_thread_id": managed_thread_id,
+                    "managed_turn_id": current_turn_id,
+                    "backend_thread_id": resolved_backend_thread_id or "",
+                    "assistant_text": outcome.assistant_text,
+                    "error": None,
+                }
+
+            if outcome.status == "interrupted":
+                try:
+                    service.record_execution_interrupted(
+                        managed_thread_id, current_turn_id
+                    )
+                except KeyError:
+                    pass
+                detail = "PMA chat interrupted"
+                await notify_managed_thread_terminal_transition(
+                    request,
+                    thread=current_thread_row,
+                    managed_thread_id=managed_thread_id,
+                    managed_turn_id=current_turn_id,
+                    to_state="failed",
+                    reason=detail,
+                )
+                return {
+                    "status": "interrupted",
+                    "managed_thread_id": managed_thread_id,
+                    "managed_turn_id": current_turn_id,
+                    "backend_thread_id": resolved_backend_thread_id or "",
+                    "assistant_text": "",
+                    "error": detail,
+                }
+
+            detail = _sanitize_managed_thread_result_error(outcome.error)
+            try:
+                service.record_execution_result(
+                    managed_thread_id,
+                    current_turn_id,
+                    status="error",
+                    assistant_text="",
+                    error=detail,
+                    backend_turn_id=outcome.backend_turn_id,
+                    transcript_turn_id=None,
+                )
+            except KeyError:
+                pass
             await notify_managed_thread_terminal_transition(
                 request,
-                thread=thread,
+                thread=current_thread_row,
                 managed_thread_id=managed_thread_id,
-                managed_turn_id=managed_turn_id,
+                managed_turn_id=current_turn_id,
                 to_state="failed",
                 reason=detail,
             )
             return {
                 "status": "error",
                 "managed_thread_id": managed_thread_id,
-                "managed_turn_id": managed_turn_id,
-                "backend_thread_id": known_backend_thread_id or "",
+                "managed_turn_id": current_turn_id,
+                "backend_thread_id": resolved_backend_thread_id or "",
                 "assistant_text": "",
                 "error": detail,
             }
 
-        async def _on_managed_turn_meta(
-            backend_thread_id: Optional[str],
-            backend_turn_id: Optional[str],
-        ) -> None:
-            nonlocal known_backend_thread_id
-            resolved_backend_turn_id = normalize_optional_text(backend_turn_id)
-            if resolved_backend_turn_id:
-                thread_store.set_turn_backend_turn_id(
-                    managed_turn_id, resolved_backend_turn_id
-                )
-            resolved_backend_thread_id = normalize_optional_text(backend_thread_id)
-            if resolved_backend_thread_id != known_backend_thread_id:
-                thread_store.set_thread_backend_id(
-                    managed_thread_id, resolved_backend_thread_id
-                )
-                known_backend_thread_id = resolved_backend_thread_id
+        def _ensure_queue_worker() -> None:
+            task_map = getattr(
+                request.app.state, "pma_managed_thread_queue_tasks", None
+            )
+            if not isinstance(task_map, dict):
+                task_map = {}
+                request.app.state.pma_managed_thread_queue_tasks = task_map
+            existing = task_map.get(managed_thread_id)
+            if isinstance(existing, asyncio.Task) and not existing.done():
+                return
 
-        async def _run_turn() -> dict[str, Any]:
-            nonlocal known_backend_thread_id
-            try:
-                if agent == "opencode":
-                    supervisor = getattr(request.app.state, "opencode_supervisor", None)
-                    if supervisor is None:
-                        return await _finalize_error("OpenCode unavailable")
-                    stall_timeout_seconds = None
-                    try:
-                        stall_timeout_seconds = (
-                            request.app.state.config.opencode.session_stall_timeout_seconds
+            worker_task: Optional[asyncio.Task[Any]] = None
+
+            async def _queue_worker() -> None:
+                try:
+                    while True:
+                        if service.get_running_execution(managed_thread_id) is not None:
+                            await asyncio.sleep(0.1)
+                            continue
+                        started = await begin_next_queued_runtime_thread_execution(
+                            service, managed_thread_id
                         )
-                    except Exception:
-                        stall_timeout_seconds = None
-                    result = await _execute_opencode(
-                        supervisor,
-                        workspace_root,
-                        execution_prompt,
-                        interrupt_event,
-                        model=model,
-                        reasoning=reasoning,
-                        backend_session_id=stored_backend_id,
-                        stall_timeout_seconds=stall_timeout_seconds,
-                        on_meta=_on_managed_turn_meta,
+                        if started is None:
+                            break
+                        await _run_execution(started)
+                except Exception:
+                    logger.exception(
+                        "Managed-thread queue worker failed (managed_thread_id=%s)",
+                        managed_thread_id,
                     )
-                elif agent == "codex":
-                    supervisor = getattr(
-                        request.app.state, "app_server_supervisor", None
-                    )
-                    events = getattr(request.app.state, "app_server_events", None)
-                    if supervisor is None or events is None:
-                        return await _finalize_error("App-server unavailable")
-                    result = await _execute_app_server(
-                        supervisor,
-                        events,
-                        workspace_root,
-                        execution_prompt,
-                        interrupt_event,
-                        model=model,
-                        reasoning=reasoning,
-                        backend_thread_id=stored_backend_id,
-                        on_meta=_on_managed_turn_meta,
-                    )
-                else:
-                    return await _finalize_error(
-                        f"Unknown managed thread agent: {agent}"
-                    )
-            except HTTPException:
-                logger.exception(
-                    "Managed thread execution failed (managed_thread_id=%s, managed_turn_id=%s)",
-                    managed_thread_id,
-                    managed_turn_id,
-                )
-                return await _finalize_error(MANAGED_THREAD_PUBLIC_EXECUTION_ERROR)
-            except Exception:
-                logger.exception(
-                    "Managed thread execution raised unexpected error (managed_thread_id=%s, managed_turn_id=%s)",
-                    managed_thread_id,
-                    managed_turn_id,
-                )
-                return await _finalize_error(MANAGED_THREAD_PUBLIC_EXECUTION_ERROR)
+                finally:
+                    if (
+                        worker_task is not None
+                        and task_map.get(managed_thread_id) is worker_task
+                    ):
+                        task_map.pop(managed_thread_id, None)
 
-            result = dict(result or {})
-            if str(result.get("status") or "") != "ok":
-                detail = _sanitize_managed_thread_result_error(result.get("detail"))
-                backend_turn_id = normalize_optional_text(result.get("turn_id"))
-                return await _finalize_error(detail, backend_turn_id=backend_turn_id)
+            worker_task = asyncio.create_task(_queue_worker())
+            task_map[managed_thread_id] = worker_task
+            _track_task(worker_task)
 
-            assistant_text = str(result.get("message") or "")
-            backend_turn_id = normalize_optional_text(result.get("turn_id"))
-            backend_thread_id = normalize_optional_text(
-                result.get("backend_thread_id") or result.get("thread_id")
-            )
-            if backend_thread_id != known_backend_thread_id:
-                thread_store.set_thread_backend_id(managed_thread_id, backend_thread_id)
-                known_backend_thread_id = backend_thread_id
-
-            transcript_metadata = {
-                "managed_thread_id": managed_thread_id,
-                "managed_turn_id": managed_turn_id,
-                "repo_id": thread.get("repo_id"),
-                "workspace_root": str(workspace_root),
-                "agent": agent,
-                "backend_thread_id": backend_thread_id,
-                "backend_turn_id": backend_turn_id,
-                "model": model,
-                "reasoning": reasoning,
+        if getattr(started_execution.execution, "status", "running") == "queued":
+            running_execution = service.get_running_execution(managed_thread_id)
+            queued_payload: dict[str, Any] = {
                 "status": "ok",
-            }
-            transcript_turn_id: Optional[str] = None
-            try:
-                transcripts.write_transcript(
-                    turn_id=managed_turn_id,
-                    metadata=transcript_metadata,
-                    assistant_text=assistant_text,
-                )
-                transcript_turn_id = managed_turn_id
-            except Exception:
-                logger.exception(
-                    "Failed to persist managed-thread transcript (managed_thread_id=%s, managed_turn_id=%s)",
-                    managed_thread_id,
-                    managed_turn_id,
-                )
-
-            thread_store.mark_turn_finished(
-                managed_turn_id,
-                status="ok",
-                assistant_text=assistant_text,
-                error=None,
-                backend_turn_id=backend_turn_id,
-                transcript_turn_id=transcript_turn_id,
-            )
-            finalized_turn = thread_store.get_turn(managed_thread_id, managed_turn_id)
-            finalized_status = str((finalized_turn or {}).get("status") or "").strip()
-            if finalized_status != "ok":
-                detail = MANAGED_THREAD_PUBLIC_EXECUTION_ERROR
-                response_status = "error"
-                if finalized_status == "interrupted":
-                    detail = "PMA chat interrupted"
-                    response_status = "interrupted"
-                elif finalized_status == "error":
-                    detail = _sanitize_managed_thread_result_error(
-                        (finalized_turn or {}).get("error")
-                    )
-                await notify_managed_thread_terminal_transition(
-                    request,
-                    thread=thread,
-                    managed_thread_id=managed_thread_id,
-                    managed_turn_id=managed_turn_id,
-                    to_state="failed",
-                    reason=detail,
-                )
-                return {
-                    "status": response_status,
-                    "managed_thread_id": managed_thread_id,
-                    "managed_turn_id": managed_turn_id,
-                    "backend_thread_id": backend_thread_id or "",
-                    "assistant_text": "",
-                    "error": detail,
-                }
-            thread_store.update_thread_after_turn(
-                managed_thread_id,
-                last_turn_id=managed_turn_id,
-                last_message_preview=preview,
-            )
-            await notify_managed_thread_terminal_transition(
-                request,
-                thread=thread,
-                managed_thread_id=managed_thread_id,
-                managed_turn_id=managed_turn_id,
-                to_state="completed",
-                reason="managed_turn_completed",
-            )
-            return {
-                "status": "ok",
+                "send_state": "queued",
+                "execution_state": "queued",
                 "managed_thread_id": managed_thread_id,
                 "managed_turn_id": managed_turn_id,
                 "backend_thread_id": backend_thread_id or "",
-                "assistant_text": assistant_text,
+                "assistant_text": "",
                 "error": None,
+                "queue_depth": service.get_queue_depth(managed_thread_id),
+                "active_managed_turn_id": (
+                    running_execution.execution_id
+                    if running_execution is not None
+                    else None
+                ),
             }
+            if notification is not None:
+                queued_payload["notification"] = notification
+            _ensure_queue_worker()
+            return queued_payload
 
         accepted_payload: dict[str, Any] = {
             "status": "ok",
@@ -927,7 +778,7 @@ def build_managed_thread_runtime_routes(
             "execution_state": "running",
             "managed_thread_id": managed_thread_id,
             "managed_turn_id": managed_turn_id,
-            "backend_thread_id": known_backend_thread_id or "",
+            "backend_thread_id": backend_thread_id or "",
             "assistant_text": "",
             "error": None,
         }
@@ -935,14 +786,11 @@ def build_managed_thread_runtime_routes(
             accepted_payload["notification"] = notification
 
         if defer_execution:
-            task_pool = getattr(request.app.state, "pma_managed_thread_tasks", None)
-            if not isinstance(task_pool, set):
-                task_pool = set()
-                request.app.state.pma_managed_thread_tasks = task_pool
 
             async def _background_run() -> None:
                 try:
-                    await _run_turn()
+                    await _run_execution(started_execution)
+                    _ensure_queue_worker()
                 except Exception:
                     logger.exception(
                         "Managed-thread background execution failed (managed_thread_id=%s, managed_turn_id=%s)",
@@ -955,14 +803,18 @@ def build_managed_thread_runtime_routes(
                         == "running"
                     ):
                         detail = MANAGED_THREAD_PUBLIC_EXECUTION_ERROR
-                        thread_store.mark_turn_finished(
-                            managed_turn_id,
-                            status="error",
-                            assistant_text="",
-                            error=detail,
-                            backend_turn_id=None,
-                            transcript_turn_id=None,
-                        )
+                        try:
+                            service.record_execution_result(
+                                managed_thread_id,
+                                managed_turn_id,
+                                status="error",
+                                assistant_text="",
+                                error=detail,
+                                backend_turn_id=None,
+                                transcript_turn_id=None,
+                            )
+                        except KeyError:
+                            pass
                         await notify_managed_thread_terminal_transition(
                             request,
                             thread=thread,
@@ -972,12 +824,11 @@ def build_managed_thread_runtime_routes(
                             reason=detail,
                         )
 
-            task = asyncio.create_task(_background_run())
-            task_pool.add(task)
-            task.add_done_callback(lambda done: task_pool.discard(done))
+            _track_task(asyncio.create_task(_background_run()))
             return accepted_payload
 
-        response = await _run_turn()
+        response = await _run_execution(started_execution)
+        _ensure_queue_worker()
         response["send_state"] = "accepted"
         response["execution_state"] = "completed"
         if notification is not None:
@@ -989,11 +840,26 @@ def build_managed_thread_runtime_routes(
         managed_thread_id: str,
         request: Request,
     ) -> dict[str, Any]:
+        from .....agents.registry import get_available_agents
+        from .....core.orchestration.catalog import map_agent_capabilities
+
         hub_root = request.app.state.config.root
         store = PmaThreadStore(hub_root)
         thread = store.get_thread(managed_thread_id)
         if thread is None:
             raise HTTPException(status_code=404, detail="Managed thread not found")
+
+        agent = str(thread.get("agent") or "").strip().lower()
+        if agent:
+            available = get_available_agents(request.app.state)
+            descriptor = available.get(agent)
+            if descriptor is not None:
+                capabilities = map_agent_capabilities(descriptor.capabilities)
+                if "interrupt" not in capabilities:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Agent '{agent}' does not support interrupt (missing capability: interrupt)",
+                    )
 
         running_turn = store.get_running_turn(managed_thread_id)
         if running_turn is None:
@@ -1008,52 +874,42 @@ def build_managed_thread_runtime_routes(
         backend_thread_id = normalize_optional_text(thread.get("backend_thread_id"))
         backend_turn_id = normalize_optional_text(running_turn.get("backend_turn_id"))
         backend_error: Optional[str] = None
-        backend_interrupt_attempted = False
-
-        if agent == "codex":
-            supervisor = getattr(request.app.state, "app_server_supervisor", None)
-            if supervisor is None:
-                backend_error = "App-server unavailable"
-            elif not backend_thread_id or not backend_turn_id:
-                backend_error = (
-                    "Codex interrupt requires backend_thread_id and backend_turn_id"
-                )
-            else:
-                backend_interrupt_attempted = True
+        backend_interrupt_attempted = True
+        service = _build_managed_thread_orchestration_service(
+            request,
+            thread_store=store,
+        )
+        try:
+            interrupted_execution = await service.interrupt_thread(managed_thread_id)
+        except Exception:
+            logger.exception(
+                "Failed to interrupt managed-thread turn via orchestration service (managed_thread_id=%s, managed_turn_id=%s)",
+                managed_thread_id,
+                managed_turn_id,
+            )
+            interrupted_execution = service.get_execution(
+                managed_thread_id,
+                managed_turn_id,
+            )
+            if (
+                interrupted_execution is None
+                or interrupted_execution.status == "running"
+            ):
+                backend_error = MANAGED_THREAD_PUBLIC_INTERRUPT_ERROR
                 try:
-                    client = await supervisor.get_client(hub_root)
-                    await client.turn_interrupt(
-                        backend_turn_id, thread_id=backend_thread_id
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to interrupt Codex managed-thread turn (managed_thread_id=%s, managed_turn_id=%s)",
+                    interrupted_execution = service.record_execution_interrupted(
                         managed_thread_id,
                         managed_turn_id,
                     )
-                    backend_error = MANAGED_THREAD_PUBLIC_INTERRUPT_ERROR
-        elif agent == "opencode":
-            supervisor = getattr(request.app.state, "opencode_supervisor", None)
-            if supervisor is None:
-                backend_error = "OpenCode unavailable"
-            elif not backend_thread_id:
-                backend_error = "OpenCode interrupt requires backend_thread_id"
-            else:
-                backend_interrupt_attempted = True
-                try:
-                    client = await supervisor.get_client(hub_root)
-                    await client.abort(backend_thread_id)
-                except Exception:
-                    logger.exception(
-                        "Failed to interrupt OpenCode managed-thread turn (managed_thread_id=%s, managed_turn_id=%s)",
+                except KeyError:
+                    interrupted_execution = service.get_execution(
                         managed_thread_id,
                         managed_turn_id,
                     )
-                    backend_error = MANAGED_THREAD_PUBLIC_INTERRUPT_ERROR
-        else:
-            backend_error = f"Unknown managed thread agent: {agent}"
 
-        interrupted = store.mark_turn_interrupted(managed_turn_id)
+        interrupted = interrupted_execution is not None and (
+            interrupted_execution.status == "interrupted"
+        )
         if interrupted:
             await notify_managed_thread_terminal_transition(
                 request,

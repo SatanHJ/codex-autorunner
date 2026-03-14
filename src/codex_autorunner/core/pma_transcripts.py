@@ -8,6 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .orchestration.migrate_legacy_state import backfill_legacy_transcript_mirrors
+from .orchestration.sqlite import open_orchestration_sqlite
+from .orchestration.transcript_mirror import (
+    TranscriptMirrorStore,
+    build_plain_text_transcript,
+)
 from .time_utils import now_iso
 from .utils import atomic_write
 
@@ -61,6 +67,7 @@ class PmaTranscriptStore:
     def __init__(self, hub_root: Path) -> None:
         self._root = hub_root
         self._dir = default_pma_transcripts_dir(hub_root)
+        self._mirror_store = TranscriptMirrorStore(hub_root)
 
     @property
     def dir(self) -> Path:
@@ -71,6 +78,7 @@ class PmaTranscriptStore:
         *,
         turn_id: str,
         metadata: dict[str, Any],
+        user_text: Optional[str] = None,
         assistant_text: str,
     ) -> PmaTranscriptPointer:
         safe_turn_id = _safe_segment(turn_id)
@@ -86,10 +94,27 @@ class PmaTranscriptStore:
         payload["metadata_path"] = str(json_path)
         payload["content_path"] = str(md_path)
         payload["assistant_text_chars"] = len(assistant_text or "")
+        resolved_user_text = user_text
+        if resolved_user_text is None:
+            raw_user_prompt = payload.get("user_prompt")
+            if isinstance(raw_user_prompt, str):
+                resolved_user_text = raw_user_prompt
+        if resolved_user_text:
+            payload["user_text_chars"] = len(resolved_user_text)
 
         self._dir.mkdir(parents=True, exist_ok=True)
-        atomic_write(md_path, (assistant_text or "") + "\n")
+        transcript_content = build_plain_text_transcript(
+            user_text=resolved_user_text or "",
+            assistant_text=assistant_text or "",
+        )
+        atomic_write(md_path, transcript_content + "\n")
         atomic_write(json_path, json.dumps(payload, indent=2) + "\n")
+        self._mirror_store.write_mirror(
+            turn_id=turn_id,
+            metadata=payload,
+            user_text=resolved_user_text,
+            assistant_text=assistant_text,
+        )
 
         return PmaTranscriptPointer(
             turn_id=turn_id,
@@ -99,6 +124,16 @@ class PmaTranscriptStore:
         )
 
     def list_recent(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        entries = self._mirror_store.list_recent(limit=limit)
+        if entries:
+            return entries
+        self._backfill_legacy_transcripts()
+        entries = self._mirror_store.list_recent(limit=limit)
+        if entries:
+            return entries
+        return self._list_recent_legacy(limit=limit)
+
+    def _list_recent_legacy(self, *, limit: int = 50) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
         if not self._dir.exists():
@@ -126,6 +161,16 @@ class PmaTranscriptStore:
         return entries
 
     def read_transcript(self, turn_id: str) -> Optional[dict[str, Any]]:
+        transcript = self._mirror_store.read_transcript(turn_id)
+        if transcript is not None:
+            return transcript
+        self._backfill_legacy_transcripts()
+        transcript = self._mirror_store.read_transcript(turn_id)
+        if transcript is not None:
+            return transcript
+        return self._read_transcript_legacy(turn_id)
+
+    def _read_transcript_legacy(self, turn_id: str) -> Optional[dict[str, Any]]:
         match = self._find_metadata(turn_id)
         if not match:
             return None
@@ -141,6 +186,10 @@ class PmaTranscriptStore:
             )
             content = ""
         return {"metadata": meta, "content": content}
+
+    def _backfill_legacy_transcripts(self) -> None:
+        with open_orchestration_sqlite(self._root) as conn:
+            backfill_legacy_transcript_mirrors(self._root, conn)
 
     def _find_metadata(self, turn_id: str) -> Optional[tuple[dict[str, Any], Path]]:
         if not self._dir.exists():

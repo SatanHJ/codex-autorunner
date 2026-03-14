@@ -23,6 +23,7 @@ from codex_autorunner.core.orchestration.service import (
     build_surface_orchestration_ingress,
     get_surface_orchestration_ingress,
 )
+from codex_autorunner.core.orchestration.sqlite import open_orchestration_sqlite
 from codex_autorunner.core.pma_thread_store import PmaThreadStore
 
 
@@ -44,6 +45,7 @@ class _FakeHarness:
     )
     next_conversation_id: str = "backend-conversation-1"
     resumed_conversation_id: Optional[str] = None
+    resume_conversation_error: Optional[Exception] = None
     next_turn_id: str = "backend-turn-1"
     ensure_ready_error: Optional[Exception] = None
     ensure_ready_calls: list[Path] = field(default_factory=list)
@@ -73,6 +75,8 @@ class _FakeHarness:
         self, workspace_root: Path, conversation_id: str
     ) -> _FakeConversation:
         self.resume_conversation_calls.append((workspace_root, conversation_id))
+        if self.resume_conversation_error is not None:
+            raise self.resume_conversation_error
         return _FakeConversation(id=self.resumed_conversation_id or conversation_id)
 
     async def start_turn(
@@ -268,6 +272,7 @@ async def test_send_message_creates_conversation_and_execution(tmp_path: Path) -
         {"type": "text", "text": "Ship it"},
         {"type": "localImage", "path": str(tmp_path / "diagram.png")},
     ]
+    assert execution.request_kind == "message"
     assert execution.status == "running"
     assert execution.backend_id == "backend-turn-1"
     assert refreshed_thread is not None
@@ -302,7 +307,12 @@ async def test_send_review_resumes_existing_backend_thread(tmp_path: Path) -> No
     assert harness.new_conversation_calls == []
     assert harness.resume_conversation_calls == [(workspace_root, "backend-existing-1")]
     assert harness.start_review_calls[0]["conversation_id"] == "backend-existing-1"
+    assert execution.request_kind == "review"
     assert execution.backend_id == "review-turn-1"
+
+    persisted = service.get_execution(thread.thread_target_id, execution.execution_id)
+    assert persisted is not None
+    assert persisted.request_kind == "review"
 
 
 async def test_send_message_persists_canonical_resumed_conversation_id(
@@ -334,6 +344,33 @@ async def test_send_message_persists_canonical_resumed_conversation_id(
     assert execution.backend_id == "backend-turn-1"
     assert refreshed_thread is not None
     assert refreshed_thread.backend_thread_id == "backend-canonical-2"
+
+
+async def test_send_message_records_error_when_resume_conversation_fails(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(resume_conversation_error=RuntimeError("missing thread"))
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target(
+        "codex",
+        workspace_root,
+        backend_thread_id="backend-existing-1",
+    )
+
+    execution = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="hello again",
+        )
+    )
+
+    assert execution.status == "error"
+    assert execution.error == "missing thread"
+    assert harness.resume_conversation_calls == [(workspace_root, "backend-existing-1")]
+    assert harness.start_turn_calls == []
 
 
 async def test_send_message_queues_when_thread_is_busy_by_default(
@@ -370,6 +407,96 @@ async def test_send_message_queues_when_thread_is_busy_by_default(
     assert refreshed_thread is not None
     assert refreshed_thread.last_execution_id == queued.execution_id
     assert refreshed_thread.last_message_preview == "second"
+
+
+async def test_send_review_preserves_request_kind_through_queue_claim_and_result(
+    tmp_path: Path,
+) -> None:
+    harness = _FakeHarness(next_turn_id="backend-turn-1")
+    service = _build_service(tmp_path, harness)
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    thread = service.create_thread_target("codex", workspace_root)
+
+    running = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="first",
+        )
+    )
+    queued = await service.send_message(
+        MessageRequest(
+            target_id=thread.thread_target_id,
+            target_kind="thread",
+            message_text="review second",
+            kind="review",
+        )
+    )
+
+    assert running.request_kind == "message"
+    assert queued.status == "queued"
+    assert queued.request_kind == "review"
+
+    claimed = service.claim_next_queued_execution_request(thread.thread_target_id)
+    assert claimed is None
+
+    completed = service.record_execution_result(
+        thread.thread_target_id,
+        running.execution_id,
+        status="ok",
+        assistant_text="done",
+        backend_turn_id="backend-turn-1",
+    )
+    assert completed.request_kind == "message"
+
+    harness.next_turn_id = "backend-review-2"
+    claimed = service.claim_next_queued_execution_request(thread.thread_target_id)
+    assert claimed is not None
+    (
+        claimed_thread,
+        claimed_execution,
+        claimed_request,
+        client_request_id,
+        sandbox_policy,
+    ) = claimed
+    assert claimed_thread.thread_target_id == thread.thread_target_id
+    assert claimed_execution.request_kind == "review"
+    assert claimed_request.kind == "review"
+    assert client_request_id is None
+    assert sandbox_policy is None
+
+    started = await service._start_execution(
+        claimed_thread,
+        claimed_request,
+        claimed_execution,
+        harness=harness,
+        workspace_root=workspace_root,
+        sandbox_policy=None,
+    )
+    assert started.request_kind == "review"
+    assert harness.start_review_calls[-1]["conversation_id"] == "backend-conversation-1"
+
+    finalized = service.record_execution_result(
+        thread.thread_target_id,
+        started.execution_id,
+        status="ok",
+        assistant_text="reviewed",
+        backend_turn_id="backend-review-2",
+    )
+    assert finalized.request_kind == "review"
+
+    with open_orchestration_sqlite(tmp_path / "hub", durable=False) as conn:
+        row = conn.execute(
+            """
+            SELECT request_kind
+              FROM orch_thread_executions
+             WHERE execution_id = ?
+            """,
+            (started.execution_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["request_kind"] == "review"
 
 
 async def test_send_message_interrupts_busy_thread_when_requested(
@@ -695,6 +822,9 @@ def test_service_exposes_binding_queries_when_binding_store_is_configured(
     assert (
         service.get_binding(surface_kind="telegram", surface_key="123:root") is not None
     )
+    turn = PmaThreadStore(hub_root).create_turn(thread.thread_target_id, prompt="busy")
     summaries = service.list_active_work_summaries(repo_id="repo-1")
     assert len(summaries) == 1
     assert summaries[0].thread_target_id == thread.thread_target_id
+    assert summaries[0].execution_id == turn["managed_turn_id"]
+    assert summaries[0].execution_status == "running"

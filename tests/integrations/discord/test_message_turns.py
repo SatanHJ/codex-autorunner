@@ -38,6 +38,7 @@ from codex_autorunner.core.ports.run_event import (
     TokenUsage,
     ToolCall,
 )
+from codex_autorunner.core.sse import format_sse
 from codex_autorunner.integrations.app_server.threads import (
     FILE_CHAT_OPENCODE_PREFIX,
     FILE_CHAT_PREFIX,
@@ -180,6 +181,20 @@ class _FakeRest:
         guild_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         return commands
+
+
+def test_sanitize_runtime_thread_result_error_returns_public_error_for_unknown_failures() -> (
+    None
+):
+    assert (
+        discord_message_turns_module._sanitize_runtime_thread_result_error(
+            "backend exploded with private detail",
+            public_error="Discord PMA turn failed",
+            timeout_error="Discord PMA turn timed out",
+            interrupted_error="Discord PMA turn interrupted",
+        )
+        == "Discord PMA turn failed"
+    )
 
 
 class _FailingChannelRest(_FakeRest):
@@ -2686,7 +2701,7 @@ async def test_message_create_streaming_turn_failure_before_completion_still_fai
         await service.run_forever()
         assert any(
             "Turn failed:" in msg["payload"].get("content", "")
-            and "hard failure before completion" in msg["payload"].get("content", "")
+            and "Discord turn failed" in msg["payload"].get("content", "")
             for msg in rest.channel_messages
         )
         assert not any(
@@ -3495,8 +3510,7 @@ async def test_message_create_streaming_turn_exception_marks_progress_failed(
             for msg in rest.edited_channel_messages
         )
         assert any(
-            "Turn failed: boom (conversation discord:channel-1:guild-1)"
-            in msg["payload"].get("content", "")
+            "Turn failed: Discord turn failed" in msg["payload"].get("content", "")
             for msg in rest.channel_messages
         )
     finally:
@@ -4922,6 +4936,385 @@ async def test_message_create_sends_queued_notice_when_dispatch_queue_is_busy(
 
 
 @pytest.mark.anyio
+async def test_repo_message_create_routes_repeated_messages_through_orchestration_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_hub_files(tmp_path, force=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+    await store.update_agent_state(channel_id="channel-1", agent="codex")
+
+    rest = _FakeRest()
+    gateway = _FakeGateway(
+        [
+            (
+                "MESSAGE_CREATE",
+                _message_create("first orchestration prompt", message_id="m-1"),
+            ),
+            (
+                "MESSAGE_CREATE",
+                _message_create("second orchestration prompt", message_id="m-2"),
+            ),
+        ]
+    )
+    service = DiscordBotService(
+        _config(tmp_path),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class _FakeHarness:
+        display_name = "Fake"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+            }
+        )
+
+        def __init__(self) -> None:
+            self.turn_prompts: list[str] = []
+            self.resume_conversation_calls: list[tuple[Path, str]] = []
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            self.resume_conversation_calls.append((workspace_root, conversation_id))
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                conversation_id,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+                input_items,
+            )
+            turn_id = f"backend-turn-{len(self.turn_prompts) + 1}"
+            self.turn_prompts.append(prompt)
+            return SimpleNamespace(conversation_id=conversation_id, turn_id=turn_id)
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, conversation_id, timeout
+            if turn_id == "backend-turn-1":
+                first_started.set()
+                await release_first.wait()
+                return SimpleNamespace(
+                    status="ok",
+                    assistant_text="first orchestration reply",
+                    errors=[],
+                )
+            return SimpleNamespace(
+                status="ok",
+                assistant_text="second orchestration reply",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            _ = workspace_root, conversation_id, turn_id
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            if False:
+                yield ""
+
+    harness = _FakeHarness()
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "get_registered_agents",
+        lambda: {
+            "codex": AgentDescriptor(
+                id="codex",
+                name="Codex",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    async def _release_later() -> None:
+        await first_started.wait()
+        await asyncio.sleep(0.05)
+        release_first.set()
+
+    release_task = asyncio.create_task(_release_later())
+    try:
+        await asyncio.wait_for(service.run_forever(), timeout=5)
+        with anyio.fail_after(2):
+            while not any(
+                "second orchestration reply" in msg["payload"].get("content", "")
+                for msg in rest.channel_messages
+            ):
+                await anyio.sleep(0.05)
+
+        contents = [msg["payload"].get("content", "") for msg in rest.channel_messages]
+        assert any(
+            "Queued (waiting for available worker...)" in content
+            for content in contents
+        )
+        assert any("first orchestration reply" in content for content in contents)
+        assert any("second orchestration reply" in content for content in contents)
+
+        thread_store = discord_message_turns_module.PmaThreadStore(tmp_path)
+        threads = thread_store.list_threads(limit=10)
+        assert len(threads) == 1
+        turns = thread_store.list_turns(threads[0]["managed_thread_id"], limit=10)
+        assert len(turns) == 2
+        assert [turn["status"] for turn in turns] == ["ok", "ok"]
+
+        orchestration_service = service._discord_thread_service()
+        binding = orchestration_service.get_binding(
+            surface_kind="discord",
+            surface_key="channel-1",
+        )
+        assert binding is not None
+        assert binding.thread_target_id == threads[0]["managed_thread_id"]
+        assert harness.resume_conversation_calls == [
+            (workspace.resolve(), "backend-thread-1")
+        ]
+    finally:
+        if not release_task.done():
+            release_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await release_task
+        await store.close()
+
+
+@pytest.mark.anyio
+async def test_pma_message_create_streams_progress_before_terminal_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_hub_files(tmp_path, force=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    store = DiscordStateStore(tmp_path / "discord_state.sqlite3")
+    await store.initialize()
+    await store.upsert_binding(
+        channel_id="channel-1",
+        guild_id="guild-1",
+        workspace_path=str(workspace),
+        repo_id="repo-1",
+    )
+    await store.update_pma_state(channel_id="channel-1", pma_enabled=True)
+    await store.update_agent_state(channel_id="channel-1", agent="codex")
+
+    rest = _FakeRest()
+    gateway = _FakeGateway(
+        [
+            (
+                "MESSAGE_CREATE",
+                _message_create("stream this prompt", message_id="m-1"),
+            ),
+        ]
+    )
+    service = DiscordBotService(
+        _config(tmp_path),
+        logger=logging.getLogger("test"),
+        rest_client=rest,
+        gateway_client=gateway,
+        state_store=store,
+        outbox_manager=_FakeOutboxManager(),
+    )
+
+    stream_finished = asyncio.Event()
+
+    class _FakeHarness:
+        display_name = "Fake"
+        capabilities = frozenset(
+            {
+                "durable_threads",
+                "message_turns",
+                "interrupt",
+                "event_streaming",
+            }
+        )
+
+        async def ensure_ready(self, workspace_root: Path) -> None:
+            _ = workspace_root
+
+        def supports(self, capability: str) -> bool:
+            return capability in self.capabilities
+
+        async def new_conversation(
+            self, workspace_root: Path, title: Optional[str] = None
+        ) -> SimpleNamespace:
+            _ = workspace_root, title
+            return SimpleNamespace(id="backend-thread-1")
+
+        async def resume_conversation(
+            self, workspace_root: Path, conversation_id: str
+        ) -> SimpleNamespace:
+            _ = workspace_root
+            return SimpleNamespace(id=conversation_id)
+
+        async def start_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            prompt: str,
+            model: Optional[str],
+            reasoning: Optional[str],
+            *,
+            approval_mode: Optional[str],
+            sandbox_policy: Optional[Any],
+            input_items: Optional[list[dict[str, Any]]] = None,
+        ) -> SimpleNamespace:
+            _ = (
+                workspace_root,
+                prompt,
+                model,
+                reasoning,
+                approval_mode,
+                sandbox_policy,
+                input_items,
+            )
+            return SimpleNamespace(
+                conversation_id=conversation_id,
+                turn_id="backend-turn-1",
+            )
+
+        async def start_review(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            raise AssertionError("review mode should not be used in this test")
+
+        async def wait_for_turn(
+            self,
+            workspace_root: Path,
+            conversation_id: str,
+            turn_id: Optional[str],
+            *,
+            timeout: Optional[float] = None,
+        ) -> SimpleNamespace:
+            _ = workspace_root, conversation_id, turn_id, timeout
+            await stream_finished.wait()
+            return SimpleNamespace(
+                status="ok",
+                assistant_text="discord managed thread final reply",
+                errors=[],
+            )
+
+        async def interrupt(
+            self, workspace_root: Path, conversation_id: str, turn_id: Optional[str]
+        ) -> None:
+            _ = workspace_root, conversation_id, turn_id
+
+        async def stream_events(
+            self, workspace_root: Path, conversation_id: str, turn_id: str
+        ):
+            _ = workspace_root, conversation_id, turn_id
+            yield format_sse(
+                "app-server",
+                {
+                    "message": {
+                        "method": "item/reasoning/summaryTextDelta",
+                        "params": {
+                            "itemId": "reason-1",
+                            "delta": "thinking through the repo",
+                        },
+                    }
+                },
+            )
+            await asyncio.sleep(1.05)
+            yield format_sse(
+                "app-server",
+                {
+                    "message": {
+                        "method": "item/agentMessage/delta",
+                        "params": {"delta": "partial discord managed reply"},
+                    }
+                },
+            )
+            stream_finished.set()
+
+    harness = _FakeHarness()
+    monkeypatch.setattr(
+        discord_message_turns_module,
+        "get_registered_agents",
+        lambda: {
+            "codex": AgentDescriptor(
+                id="codex",
+                name="Codex",
+                capabilities=harness.capabilities,
+                make_harness=lambda _ctx: harness,
+            )
+        },
+    )
+
+    try:
+        await asyncio.wait_for(service.run_forever(), timeout=5)
+        assert rest.edited_channel_messages
+        assert any(
+            "partial discord managed reply" in msg["payload"].get("content", "")
+            for msg in rest.edited_channel_messages
+        )
+        assert any(
+            msg["payload"].get("components") for msg in rest.edited_channel_messages
+        )
+        assert any(
+            "discord managed thread final reply" in msg["payload"].get("content", "")
+            for msg in rest.channel_messages
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.anyio
 async def test_pma_message_create_routes_repeated_messages_through_managed_thread_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5467,23 +5860,23 @@ async def test_car_session_compact_reuses_preview_without_part_numbering(
         outbox_manager=_FakeOutboxManager(),
     )
 
-    class _CompactOrchestrator:
-        def __init__(self) -> None:
-            self.reset_calls: list[str] = []
-
-        def get_thread_id(self, session_key: str) -> Optional[str]:
-            _ = session_key
-            return "thread-1"
-
-        def reset_thread_id(self, session_key: str) -> bool:
-            self.reset_calls.append(session_key)
-            return True
-
-    orchestrator = _CompactOrchestrator()
-
-    async def _fake_orchestrator_for_workspace(*args: Any, **kwargs: Any):
-        _ = args, kwargs
-        return orchestrator
+    orchestration_service = service._discord_thread_service()
+    current_thread = orchestration_service.create_thread_target(
+        "codex",
+        workspace.resolve(),
+        display_name="discord:channel-1",
+    )
+    orchestration_service.resume_thread_target(
+        current_thread.thread_target_id,
+        backend_thread_id="backend-thread-1",
+    )
+    service._attach_discord_thread_binding(
+        channel_id="channel-1",
+        thread_target_id=current_thread.thread_target_id,
+        agent="codex",
+        repo_id=None,
+        pma_enabled=False,
+    )
 
     summary = "\n".join(
         [
@@ -5516,7 +5909,6 @@ async def test_car_session_compact_reuses_preview_without_part_numbering(
             preview_message_id="preview-1",
         )
 
-    service._orchestrator_for_workspace = _fake_orchestrator_for_workspace  # type: ignore[assignment]
     service._run_agent_turn_for_message = _fake_run_turn  # type: ignore[assignment]
 
     try:
@@ -5549,7 +5941,12 @@ async def test_car_session_compact_reuses_preview_without_part_numbering(
         assert "Context from previous conversation:" in binding["pending_compact_seed"]
         assert summary in binding["pending_compact_seed"]
         assert binding["pending_compact_session_key"]
-        assert orchestrator.reset_calls == [binding["pending_compact_session_key"]]
+        assert binding["pending_compact_session_key"] != current_thread.thread_target_id
+        archived_thread = orchestration_service.get_thread_target(
+            current_thread.thread_target_id
+        )
+        assert archived_thread is not None
+        assert archived_thread.lifecycle_status == "archived"
     finally:
         await store.close()
 
@@ -5579,23 +5976,23 @@ async def test_car_session_compact_places_continue_button_on_last_chunk_without_
         outbox_manager=_FakeOutboxManager(),
     )
 
-    class _CompactOrchestrator:
-        def __init__(self) -> None:
-            self.reset_calls: list[str] = []
-
-        def get_thread_id(self, session_key: str) -> Optional[str]:
-            _ = session_key
-            return "thread-1"
-
-        def reset_thread_id(self, session_key: str) -> bool:
-            self.reset_calls.append(session_key)
-            return True
-
-    orchestrator = _CompactOrchestrator()
-
-    async def _fake_orchestrator_for_workspace(*args: Any, **kwargs: Any):
-        _ = args, kwargs
-        return orchestrator
+    orchestration_service = service._discord_thread_service()
+    current_thread = orchestration_service.create_thread_target(
+        "codex",
+        workspace.resolve(),
+        display_name="discord:channel-1",
+    )
+    orchestration_service.resume_thread_target(
+        current_thread.thread_target_id,
+        backend_thread_id="backend-thread-1",
+    )
+    service._attach_discord_thread_binding(
+        channel_id="channel-1",
+        thread_target_id=current_thread.thread_target_id,
+        agent="codex",
+        repo_id=None,
+        pma_enabled=False,
+    )
 
     summary = "\n".join(
         [
@@ -5628,7 +6025,6 @@ async def test_car_session_compact_places_continue_button_on_last_chunk_without_
             preview_message_id=None,
         )
 
-    service._orchestrator_for_workspace = _fake_orchestrator_for_workspace  # type: ignore[assignment]
     service._run_agent_turn_for_message = _fake_run_turn  # type: ignore[assignment]
 
     try:
@@ -5656,6 +6052,11 @@ async def test_car_session_compact_places_continue_button_on_last_chunk_without_
         assert "Context from previous conversation:" in binding["pending_compact_seed"]
         assert summary in binding["pending_compact_seed"]
         assert binding["pending_compact_session_key"]
-        assert orchestrator.reset_calls == [binding["pending_compact_session_key"]]
+        assert binding["pending_compact_session_key"] != current_thread.thread_target_id
+        archived_thread = orchestration_service.get_thread_target(
+            current_thread.thread_target_id
+        )
+        assert archived_thread is not None
+        assert archived_thread.lifecycle_status == "archived"
     finally:
         await store.close()

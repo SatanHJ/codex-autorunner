@@ -641,6 +641,7 @@ def build_managed_thread_crud_routes(
             "turns": [
                 {
                     "managed_turn_id": turn.get("managed_turn_id"),
+                    "request_kind": turn.get("request_kind"),
                     "status": turn.get("status"),
                     "prompt_preview": _truncate_text(turn.get("prompt") or "", 120),
                     "assistant_preview": _truncate_text(
@@ -731,6 +732,7 @@ def build_managed_thread_crud_routes(
         repo_id: Optional[str] = None,
         limit: int = 200,
     ) -> dict[str, Any]:
+        """List busy thread summaries for running or queued work only."""
         if limit <= 0:
             raise HTTPException(status_code=400, detail="limit must be greater than 0")
         service = build_managed_thread_orchestration_service(request)

@@ -304,6 +304,7 @@ def test_pma_thread_status_includes_queued_turns(hub_env) -> None:
     assert (
         payload["queued_turns"][0]["managed_turn_id"] == queued_turn["managed_turn_id"]
     )
+    assert payload["queued_turns"][0]["request_kind"] == "message"
     assert payload["queued_turns"][0]["state"] == "queued"
     assert payload["queued_turns"][0]["prompt_preview"] == "second"
 
@@ -434,7 +435,7 @@ def test_pma_chat_persists_transcript_and_history_entry(hub_env) -> None:
     )
     assert transcript is not None
     assert transcript["content"].strip() == (
-        "User:\n" "persist transcript\n\n" "Assistant:\n" "assistant transcript payload"
+        "User:\npersist transcript\n\nAssistant:\nassistant transcript payload"
     )
     metadata = transcript["metadata"]
     assert metadata["client_turn_id"] == "client-transcript"
@@ -450,7 +451,7 @@ def test_pma_chat_persists_transcript_and_history_entry(hub_env) -> None:
     history_entry = client.get(f"/hub/pma/history/{transcript_turn_id}")
     assert history_entry.status_code == 200
     assert history_entry.json()["content"].strip() == (
-        "User:\n" "persist transcript\n\n" "Assistant:\n" "assistant transcript payload"
+        "User:\npersist transcript\n\nAssistant:\nassistant transcript payload"
     )
 
 
@@ -1384,6 +1385,7 @@ def test_pma_managed_thread_status_and_tail_use_orchestration_service(
                 execution_id="turn-1",
                 target_id="thread-1",
                 target_kind="thread",
+                request_kind="review",
                 status="ok",
                 backend_id="backend-turn-1",
                 started_at="2026-03-13T00:00:00Z",
@@ -2372,7 +2374,8 @@ def test_pma_orchestration_service_integration_for_thread_operations(
 
     fake_service = FakeService()
     monkeypatch.setattr(
-        "codex_autorunner.surfaces.web.routes.pma_routes.tail_stream.build_managed_thread_orchestration_service",
+        tail_stream,
+        "build_managed_thread_orchestration_service",
         lambda request: fake_service,
     )
     app = create_hub_app(hub_env.hub_root)

@@ -35,7 +35,10 @@ from codex_autorunner.integrations.telegram.state import topic_key as telegram_t
 from codex_autorunner.manifest import load_manifest, save_manifest
 from codex_autorunner.server import create_hub_app
 
-pytestmark = pytest.mark.docker_managed_cleanup
+pytestmark = [
+    pytest.mark.docker_managed_cleanup,
+    pytest.mark.slow,
+]
 
 
 def _init_git_repo(path: Path) -> None:
@@ -1103,7 +1106,17 @@ def test_hub_channel_directory_route_includes_pma_managed_threads(
     )
 
     store = PmaThreadStore(hub_root)
-    created = store.create_thread("codex", worktree.path, repo_id=worktree.id)
+    created = store.create_thread(
+        "codex",
+        worktree.path,
+        repo_id=worktree.id,
+        name="ticket-flow:codex",
+        metadata={
+            "thread_kind": "ticket_flow",
+            "flow_type": "ticket_flow",
+            "run_id": "run-123",
+        },
+    )
     managed_thread_id = str(created["managed_thread_id"])
 
     client = TestClient(create_hub_app(hub_root))
@@ -1120,6 +1133,8 @@ def test_hub_channel_directory_route_includes_pma_managed_threads(
     assert pma_row["provenance"]["source"] == "pma_thread"
     assert pma_row["provenance"]["agent"] == "codex"
     assert pma_row["provenance"]["managed_thread_id"] == managed_thread_id
+    assert pma_row["provenance"]["thread_kind"] == "ticket_flow"
+    assert pma_row["provenance"]["run_id"] == "run-123"
     assert pma_row["channel_status"] == "idle"
     assert pma_row["status_label"] == "idle"
     assert pma_row["provenance"]["status_reason_code"] == "thread_created"

@@ -134,6 +134,8 @@ def _normalize_thread_record(row: Any) -> dict[str, Any]:
     record["status_changed_at"] = snapshot.changed_at
     record["status_terminal"] = bool(snapshot.terminal)
     record["status_turn_id"] = snapshot.turn_id
+    if "metadata_json" in record and "metadata" not in record:
+        record["metadata"] = _json_loads_object(record.get("metadata_json"))
     return record
 
 
@@ -159,6 +161,7 @@ def _ensure_schema(conn: Any) -> None:
                 last_turn_id TEXT,
                 last_message_preview TEXT,
                 compact_seed TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -230,6 +233,10 @@ def _ensure_schema(conn: Any) -> None:
         (
             "status_turn_id",
             "ALTER TABLE pma_managed_threads ADD COLUMN status_turn_id TEXT",
+        ),
+        (
+            "metadata_json",
+            "ALTER TABLE pma_managed_threads ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
         ),
     ):
         if statement[0] not in thread_columns:
@@ -403,6 +410,11 @@ class PmaThreadStore:
             "last_turn_id": row["last_execution_id"],
             "last_message_preview": row["last_message_preview"],
             "compact_seed": row["compact_seed"],
+            "metadata": (
+                _json_loads_object(row["metadata_json"])
+                if "metadata_json" in row.keys()
+                else {}
+            ),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -498,6 +510,7 @@ class PmaThreadStore:
         resource_id: Optional[str] = None,
         name: Optional[str] = None,
         backend_thread_id: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         managed_thread_id = str(uuid.uuid4())
         now = now_iso()
@@ -536,11 +549,12 @@ class PmaThreadStore:
                         last_execution_id,
                         last_message_preview,
                         compact_seed,
+                        metadata_json,
                         created_at,
                         updated_at,
                         status_updated_at,
                         status_terminal
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         managed_thread_id,
@@ -558,6 +572,7 @@ class PmaThreadStore:
                         None,
                         None,
                         None,
+                        _json_dumps(metadata or {}),
                         now,
                         now,
                         snapshot.changed_at,
@@ -582,9 +597,9 @@ class PmaThreadStore:
         repo_id: Optional[str] = None,
         resource_kind: Optional[str] = None,
         resource_id: Optional[str] = None,
-        limit: int = 200,
+        limit: Optional[int] = 200,
     ) -> list[dict[str, Any]]:
-        if limit <= 0:
+        if limit is not None and limit <= 0:
             return []
 
         query = """
@@ -619,8 +634,9 @@ class PmaThreadStore:
             query += " AND repo_id = ?"
             params.append(normalized_repo_id)
         query += " ORDER BY updated_at DESC, created_at DESC, thread_target_id DESC"
-        query += " LIMIT ?"
-        params.append(limit)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
 
         with self._read_conn() as conn:
             rows = conn.execute(query, params).fetchall()
@@ -1487,9 +1503,10 @@ class PmaThreadStore:
                             last_turn_id,
                             last_message_preview,
                             compact_seed,
+                            metadata_json,
                             created_at,
                             updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             legacy["managed_thread_id"],
@@ -1509,6 +1526,11 @@ class PmaThreadStore:
                             legacy["last_turn_id"],
                             legacy["last_message_preview"],
                             legacy["compact_seed"],
+                            _json_dumps(
+                                legacy["metadata"]
+                                if isinstance(legacy.get("metadata"), dict)
+                                else {}
+                            ),
                             legacy["created_at"],
                             legacy["updated_at"],
                         ),

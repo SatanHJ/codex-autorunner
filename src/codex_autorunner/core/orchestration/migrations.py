@@ -8,7 +8,7 @@ from typing import Callable
 from ..time_utils import now_iso
 from .models import OrchestrationTableDefinition
 
-ORCHESTRATION_SCHEMA_VERSION = 6
+ORCHESTRATION_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -679,6 +679,16 @@ def _apply_v6(conn: sqlite3.Connection) -> None:
         )
 
 
+def _apply_v7(conn: sqlite3.Connection) -> None:
+    _apply_v6(conn)
+    _ensure_column(
+        conn,
+        "orch_thread_targets",
+        "metadata_json",
+        "metadata_json TEXT NOT NULL DEFAULT '{}'",
+    )
+
+
 _MIGRATIONS = (
     _MigrationStep(1, "create_core_orchestration_schema", _apply_v1),
     _MigrationStep(2, "add_binding_and_flow_projection_scaffolding", _apply_v2),
@@ -686,6 +696,11 @@ _MIGRATIONS = (
     _MigrationStep(4, "add_transcript_metadata_and_projection_processing", _apply_v4),
     _MigrationStep(5, "enforce_active_binding_uniqueness", _apply_v5),
     _MigrationStep(6, "generalize_resource_ownership", _apply_v6),
+    _MigrationStep(
+        7,
+        "backfill_thread_target_metadata_and_resource_ownership",
+        _apply_v7,
+    ),
 )
 
 

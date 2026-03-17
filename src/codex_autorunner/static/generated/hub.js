@@ -22,6 +22,18 @@ function isCleanupBlockedByChatBinding(repo) {
 function isChatBoundWorktree(repo) {
     return isCleanupBlockedByChatBinding(repo);
 }
+function unboundManagedThreadCount(repo) {
+    return Math.max(0, Number(repo.unbound_managed_thread_count || 0));
+}
+function baseReposWithUnboundThreads(repos) {
+    return repos.filter((repo) => (repo.kind || "base") === "base" && unboundManagedThreadCount(repo) > 0);
+}
+function totalUnboundManagedThreadCount(repos) {
+    return repos.reduce((total, repo) => total + unboundManagedThreadCount(repo), 0);
+}
+function dirtyBaseReposWithUnboundThreads(repos) {
+    return baseReposWithUnboundThreads(repos).filter((repo) => repo.is_clean === false);
+}
 const HUB_VIEW_PREFS_KEY = `car:hub-view-prefs:${HUB_BASE || "/"}`;
 const HUB_DEFAULT_VIEW_PREFS = {
     flowFilter: "all",
@@ -56,6 +68,7 @@ const pmaVersionEl = document.getElementById("pma-version");
 const hubRepoSearchInput = document.getElementById("hub-repo-search");
 const hubFlowFilterEl = document.getElementById("hub-flow-filter");
 const hubSortOrderEl = document.getElementById("hub-sort-order");
+const hubCleanupAllThreadsBtn = document.getElementById("hub-cleanup-all-threads");
 const hubRepoPanelEl = document.getElementById("hub-repo-panel");
 const hubAgentPanelEl = document.getElementById("hub-agent-panel");
 const hubShellEl = document.getElementById("hub-shell");
@@ -416,6 +429,27 @@ async function pollHubJob(jobId, { timeoutMs = HUB_JOB_TIMEOUT_MS } = {}) {
         await sleep(HUB_JOB_POLL_INTERVAL_MS);
     }
 }
+function updateCleanupAllThreadsButton(repos) {
+    if (!hubCleanupAllThreadsBtn)
+        return;
+    const cleanupRepos = baseReposWithUnboundThreads(repos);
+    const totalThreads = totalUnboundManagedThreadCount(cleanupRepos);
+    const dirtyRepos = dirtyBaseReposWithUnboundThreads(repos);
+    hubCleanupAllThreadsBtn.textContent =
+        totalThreads > 0 ? `Cleanup all (${totalThreads})` : "Cleanup all";
+    hubCleanupAllThreadsBtn.disabled = totalThreads <= 0;
+    if (totalThreads <= 0) {
+        hubCleanupAllThreadsBtn.title =
+            "No stale non-chat-bound managed threads across base repos";
+        return;
+    }
+    const dirtySummary = dirtyRepos.length
+        ? ` Includes ${dirtyRepos.length} dirty repo${dirtyRepos.length === 1 ? "" : "s"}.`
+        : "";
+    hubCleanupAllThreadsBtn.title =
+        `Archive ${totalThreads} stale non-chat-bound managed thread${totalThreads === 1 ? "" : "s"} across ${cleanupRepos.length} base repo${cleanupRepos.length === 1 ? "" : "s"}.` +
+            dirtySummary;
+}
 async function startHubJob(path, { body, startedMessage } = {}) {
     const job = await api(path, { method: "POST", body });
     if (startedMessage) {
@@ -444,6 +478,7 @@ function formatTimeCompact(isoString) {
 function renderSummary(repos) {
     const running = repos.filter((r) => r.status === "running").length;
     const missing = repos.filter((r) => !r.exists_on_disk).length;
+    updateCleanupAllThreadsButton(repos);
     if (totalEl)
         totalEl.textContent = repos.length.toString();
     if (runningEl)
@@ -777,6 +812,17 @@ function buildActions(repo) {
             kind: "ghost",
             title: syncTitle,
             disabled: syncDisabled,
+        });
+        actions.push({
+            key: "cleanup_repo_threads",
+            label: unboundManagedThreadCount(repo) > 0
+                ? `Cleanup threads (${unboundManagedThreadCount(repo)})`
+                : "Cleanup threads",
+            kind: "ghost",
+            title: unboundManagedThreadCount(repo) > 0
+                ? `Archive ${unboundManagedThreadCount(repo)} stale non-chat-bound managed thread${unboundManagedThreadCount(repo) === 1 ? "" : "s"} for this repo`
+                : "No stale non-chat-bound managed threads for this repo",
+            disabled: unboundManagedThreadCount(repo) <= 0,
         });
     }
     if (!missing && kind === "worktree") {
@@ -1198,11 +1244,46 @@ function channelPmaDetails(channel) {
 function isManagedPmaChannel(channel) {
     return channelSource(channel) === "pma_thread";
 }
-function channelDisplayLabel(channel) {
+function rawChannelDisplayLabel(channel) {
     if (typeof channel.display === "string" && channel.display.trim()) {
         return channel.display.trim();
     }
     return channel.key;
+}
+function titleCaseWord(value) {
+    if (!value)
+        return value;
+    return value.charAt(0).toUpperCase() + value.slice(1);
+}
+function channelDisplayLabel(channel) {
+    const rawLabel = rawChannelDisplayLabel(channel);
+    if (channelSource(channel) !== "pma_thread") {
+        return rawLabel;
+    }
+    const normalizedRaw = rawLabel.trim().toLowerCase();
+    const threadKind = String(channel.provenance?.thread_kind || channel.meta?.thread_kind || "")
+        .trim()
+        .toLowerCase();
+    if (threadKind === "ticket_flow" ||
+        normalizedRaw === "ticket-flow" ||
+        normalizedRaw.startsWith("ticket-flow:")) {
+        return "Ticket flow";
+    }
+    if (normalizedRaw.startsWith("pma:") ||
+        normalizedRaw === "pma" ||
+        threadKind === "interactive") {
+        const agent = String(channel.provenance?.agent || channel.meta?.agent || "")
+            .trim()
+            .toLowerCase();
+        return agent ? `${titleCaseWord(agent)} thread` : "Agent thread";
+    }
+    if (normalizedRaw.startsWith("discord:")) {
+        return "Discord thread";
+    }
+    if (normalizedRaw.startsWith("telegram:")) {
+        return "Telegram thread";
+    }
+    return rawLabel;
 }
 function channelOwnerSummary(channel) {
     const resourceKind = String(channel.resource_kind || channel.provenance?.resource_kind || "")
@@ -1293,7 +1374,7 @@ function pmaChannelGroupKey(channel) {
     const threadKind = String(channel.provenance?.thread_kind || channel.meta?.thread_kind || "")
         .trim()
         .toLowerCase();
-    const display = channelDisplayLabel(channel);
+    const display = rawChannelDisplayLabel(channel);
     const normalizedDisplay = display.trim().toLowerCase();
     if (threadKind === "ticket_flow" ||
         normalizedDisplay === "ticket-flow" ||
@@ -1305,8 +1386,24 @@ function pmaChannelGroupKey(channel) {
 function pmaChannelGroupLabel(channel) {
     const key = pmaChannelGroupKey(channel);
     if (key === "ticket-flow")
-        return "ticket-flow";
+        return "Ticket flow";
     return channelDisplayLabel(channel);
+}
+function isDuplicateChatBoundPmaChannel(channel, visibleChannels) {
+    const normalizedLabel = rawChannelDisplayLabel(channel).trim().toLowerCase();
+    if (!normalizedLabel ||
+        (!normalizedLabel.startsWith("discord:") &&
+            !normalizedLabel.startsWith("telegram:"))) {
+        return false;
+    }
+    return visibleChannels.some((channel) => {
+        const channelKey = String(channel.key || "")
+            .trim()
+            .toLowerCase();
+        return (channelKey === normalizedLabel ||
+            channelKey.startsWith(`${normalizedLabel}:`) ||
+            normalizedLabel.startsWith(`${channelKey}:`));
+    });
 }
 function groupPmaChannels(channels) {
     const grouped = new Map();
@@ -1435,6 +1532,7 @@ function renderRepos(repos) {
     if (!repoListEl)
         return;
     repoListEl.innerHTML = "";
+    updateCleanupAllThreadsButton(repos);
     const searchQuery = normalizedHubSearch();
     const repoChannels = channelsByRepoId(hubChannelEntries);
     if (!repos.length) {
@@ -1568,8 +1666,8 @@ function renderRepos(repos) {
         const lastActivity = formatLastActivity(repo);
         const runDuration = repo.last_run_finished_at ? formatRunDuration(repo.last_run_duration_seconds) : "";
         const pmaChannels = inlineChannels.filter((channel) => isManagedPmaChannel(channel));
-        const pmaGroups = groupPmaChannels(pmaChannels);
         const visibleChannels = inlineChannels.filter((channel) => !isManagedPmaChannel(channel));
+        const pmaGroups = groupPmaChannels(pmaChannels.filter((channel) => !isDuplicateChatBoundPmaChannel(channel, visibleChannels)));
         const primaryChannel = visibleChannels[0] || null;
         const infoItems = [];
         if (!primaryChannel) {
@@ -2555,6 +2653,28 @@ async function handleRepoAction(repoId, action) {
             await refreshHub();
             return;
         }
+        if (action === "cleanup_repo_threads") {
+            const repo = hubData.repos.find((item) => item.id === repoId);
+            if (!repo) {
+                flash(`Repo not found: ${repoId}`, "error");
+                return;
+            }
+            const cleanupCount = unboundManagedThreadCount(repo);
+            if (cleanupCount <= 0) {
+                flash(`No stale non-chat threads for ${repo.display_name || repoId}`, "success");
+                return;
+            }
+            const displayName = repo.display_name || repoId;
+            const response = (await api(`/hub/repos/${encodeURIComponent(repoId)}/cleanup-threads`, {
+                method: "POST",
+            }));
+            const message = typeof response?.message === "string" && response.message.trim()
+                ? response.message.trim()
+                : `Cleaned up stale threads for ${displayName}`;
+            flash(message, "success");
+            await refreshHub();
+            return;
+        }
         if (action === "archive_state") {
             const repo = hubData.repos.find((item) => item.id === repoId);
             if (!repo || !repo.has_car_state)
@@ -2589,6 +2709,42 @@ async function handleRepoAction(repoId, action) {
         buttons?.forEach((btn) => btn.disabled = false);
     }
 }
+async function handleCleanupAllRepoThreads() {
+    if (!hubCleanupAllThreadsBtn)
+        return;
+    const cleanupRepos = baseReposWithUnboundThreads(hubData.repos || []);
+    const totalThreads = totalUnboundManagedThreadCount(cleanupRepos);
+    if (totalThreads <= 0) {
+        flash("No stale non-chat threads across base repos", "success");
+        return;
+    }
+    const dirtyRepos = dirtyBaseReposWithUnboundThreads(hubData.repos || []);
+    const dirtyWarning = dirtyRepos.length
+        ? `\n\nDirty repos:\n${dirtyRepos
+            .map((repo) => `- ${repo.display_name || repo.id}`)
+            .join("\n")}\n\nThese repos are dirty, but cleanup only archives unbound managed threads.`
+        : "";
+    const ok = await confirmModal(`Clean up stale non-chat threads across ${cleanupRepos.length} base repo${cleanupRepos.length === 1 ? "" : "s"}?\n\nCAR will archive ${totalThreads} unbound managed thread${totalThreads === 1 ? "" : "s"}. Discord and Telegram-bound threads will stay active.${dirtyWarning}`, { confirmText: "Cleanup all" });
+    if (!ok)
+        return;
+    hubCleanupAllThreadsBtn.disabled = true;
+    try {
+        const response = (await api("/hub/repos/cleanup-threads", {
+            method: "POST",
+        }));
+        const message = typeof response?.message === "string" && response.message.trim()
+            ? response.message.trim()
+            : "Cleaned up stale threads across base repos";
+        flash(message, "success");
+        await refreshHub();
+    }
+    catch (err) {
+        flash(err.message || "Bulk cleanup failed", "error");
+    }
+    finally {
+        updateCleanupAllThreadsButton(hubData.repos || []);
+    }
+}
 function attachHubHandlers() {
     initHubSettings();
     const refreshBtn = document.getElementById("hub-refresh");
@@ -2606,6 +2762,11 @@ function attachHubHandlers() {
     }
     if (hubUsageRefresh) {
         hubUsageRefresh.addEventListener("click", () => loadHubUsage());
+    }
+    if (hubCleanupAllThreadsBtn) {
+        hubCleanupAllThreadsBtn.addEventListener("click", () => {
+            void handleCleanupAllRepoThreads();
+        });
     }
     if (hubRepoSearchInput) {
         hubRepoSearchInput.addEventListener("input", () => {

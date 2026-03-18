@@ -884,6 +884,7 @@ class PmaConfig:
     default_agent: str
     model: Optional[str]
     reasoning: Optional[str]
+    managed_thread_terminal_followup_default: bool
     max_upload_bytes: int
     max_repos: int
     max_messages: int
@@ -1866,6 +1867,12 @@ def _parse_pma_config(
     model = str(model_raw).strip() or None if model_raw else None
     reasoning_raw = cfg.get("reasoning", defaults.get("reasoning"))
     reasoning = str(reasoning_raw).strip() or None if reasoning_raw else None
+    managed_thread_terminal_followup_default = bool(
+        cfg.get(
+            "managed_thread_terminal_followup_default",
+            defaults.get("managed_thread_terminal_followup_default", True),
+        )
+    )
     max_upload_bytes_raw = cfg.get(
         "max_upload_bytes", defaults.get("max_upload_bytes", 10_000_000)
     )
@@ -1985,6 +1992,7 @@ def _parse_pma_config(
         default_agent=default_agent,
         model=model,
         reasoning=reasoning,
+        managed_thread_terminal_followup_default=managed_thread_terminal_followup_default,
         max_upload_bytes=max_upload_bytes,
         max_repos=max_repos,
         max_messages=max_messages,

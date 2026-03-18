@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import types
 from pathlib import Path
 from typing import Optional
 
@@ -739,6 +740,169 @@ def test_hub_archive_state_endpoint_archives_and_resets_runtime_state(tmp_path: 
     thread = store.get_thread(created["managed_thread_id"])
     assert thread is not None
     assert thread["lifecycle_status"] == "archived"
+
+
+@pytest.mark.slow
+def test_hub_archive_repo_state_endpoint_archives_and_resets_base_repo_runtime_state(
+    tmp_path: Path,
+):
+    hub_root = tmp_path / "hub"
+    cfg = json.loads(json.dumps(DEFAULT_HUB_CONFIG))
+    cfg_path = hub_root / CONFIG_FILENAME
+    write_test_config(cfg_path, cfg)
+
+    supervisor = HubSupervisor(
+        load_hub_config(hub_root),
+        backend_factory_builder=build_agent_backend_factory,
+        app_server_supervisor_factory_builder=build_app_server_supervisor_factory,
+        backend_orchestrator_builder=build_backend_orchestrator,
+    )
+    base = supervisor.create_repo("base")
+    base_car = base.path / ".codex-autorunner"
+    (base_car / "tickets" / "TICKET-123-demo.md").write_text(
+        "demo ticket", encoding="utf-8"
+    )
+    (base_car / "contextspace" / "active_context.md").write_text(
+        "active context", encoding="utf-8"
+    )
+    dispatch_dir = base_car / "runs" / "run-1" / "dispatch"
+    dispatch_dir.mkdir(parents=True, exist_ok=True)
+    (dispatch_dir / "DISPATCH.md").write_text("dispatch", encoding="utf-8")
+    (base_car / "codex-autorunner.log").write_text("log", encoding="utf-8")
+    store = PmaThreadStore(hub_root)
+    created = store.create_thread("codex", base.path, repo_id=base.id)
+
+    app = create_hub_app(hub_root)
+    client = TestClient(app)
+
+    repos_resp = client.get("/hub/repos")
+    assert repos_resp.status_code == 200
+    base_payload = next(
+        item for item in repos_resp.json()["repos"] if item["id"] == base.id
+    )
+    assert base_payload["has_car_state"] is True
+
+    archive_resp = client.post(
+        "/hub/repos/archive-state",
+        json={"repo_id": base.id},
+    )
+    assert archive_resp.status_code == 200
+    payload = archive_resp.json()
+    assert "tickets" in payload["archived_paths"]
+    assert "runs" in payload["archived_paths"]
+    assert "codex-autorunner.log" in payload["archived_paths"]
+
+    snapshot_root = Path(payload["snapshot_path"])
+    assert (snapshot_root / "tickets" / "TICKET-123-demo.md").exists()
+    assert (snapshot_root / "runs" / "run-1" / "dispatch" / "DISPATCH.md").exists()
+    assert (snapshot_root / "logs" / "codex-autorunner.log").read_text(
+        encoding="utf-8"
+    ) == "log"
+    assert (base_car / "contextspace" / "active_context.md").read_text(
+        encoding="utf-8"
+    ) == ""
+    assert not (base_car / "tickets" / "TICKET-123-demo.md").exists()
+    assert not (base_car / "runs").exists()
+
+    repos_after_resp = client.get("/hub/repos")
+    assert repos_after_resp.status_code == 200
+    base_after = next(
+        item for item in repos_after_resp.json()["repos"] if item["id"] == base.id
+    )
+    assert base_after["has_car_state"] is False
+    thread = store.get_thread(created["managed_thread_id"])
+    assert thread is not None
+    assert thread["lifecycle_status"] == "archived"
+
+
+def test_archive_repo_state_waits_for_runner_exit_before_archiving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hub_root = tmp_path / "hub"
+    cfg = json.loads(json.dumps(DEFAULT_HUB_CONFIG))
+    cfg_path = hub_root / CONFIG_FILENAME
+    write_test_config(cfg_path, cfg)
+
+    supervisor = HubSupervisor(
+        load_hub_config(hub_root),
+        backend_factory_builder=build_agent_backend_factory,
+        app_server_supervisor_factory_builder=build_app_server_supervisor_factory,
+        backend_orchestrator_builder=build_backend_orchestrator,
+    )
+    base = supervisor.create_repo("base")
+    state_path = base.path / ".codex-autorunner" / "state.sqlite3"
+    state_path.write_text("stub", encoding="utf-8")
+
+    class _FakeRunner:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+            self.reconcile_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+        def reconcile(self) -> None:
+            self.reconcile_calls += 1
+
+    fake_runner = _FakeRunner()
+    archived: list[str] = []
+
+    monkeypatch.setattr(
+        supervisor,
+        "_ensure_runner",
+        lambda repo_id, allow_uninitialized=True: fake_runner,
+    )
+    monkeypatch.setattr(hub_module.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        hub_module,
+        "read_lock_status",
+        lambda _path: (
+            hub_module.LockStatus.LOCKED_ALIVE
+            if fake_runner.reconcile_calls < 2
+            else hub_module.LockStatus.UNLOCKED
+        ),
+    )
+    monkeypatch.setattr(
+        hub_module,
+        "load_state",
+        lambda _path: hub_module.RunnerState(
+            last_run_id=None,
+            status="running" if fake_runner.reconcile_calls < 2 else "idle",
+            last_exit_code=None,
+            last_run_started_at=None,
+            last_run_finished_at=None,
+            runner_pid=123 if fake_runner.reconcile_calls < 2 else None,
+        ),
+    )
+    monkeypatch.setattr(
+        hub_module,
+        "archive_workspace_car_state",
+        lambda **_kwargs: archived.append("called")
+        or types.SimpleNamespace(
+            snapshot_id="snap",
+            snapshot_path=base.path / ".codex-autorunner" / "archive",
+            meta_path=base.path / ".codex-autorunner" / "archive" / "META.json",
+            status="complete",
+            file_count=0,
+            total_bytes=0,
+            flow_run_count=0,
+            latest_flow_run_id=None,
+            archived_paths=(),
+            reset_paths=(),
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_archive_bound_pma_threads",
+        lambda **_kwargs: [],
+    )
+
+    supervisor.archive_repo_state(repo_id=base.id)
+
+    assert fake_runner.stop_calls == 1
+    assert fake_runner.reconcile_calls >= 2
+    assert archived == ["called"]
 
 
 def test_hub_pin_parent_repo_endpoint_persists(tmp_path: Path):

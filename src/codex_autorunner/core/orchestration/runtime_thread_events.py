@@ -50,6 +50,7 @@ class RuntimeThreadRunEventState:
     assistant_message_text: str = ""
     token_usage: Optional[dict[str, Any]] = None
     last_error_message: Optional[str] = None
+    completed_seen: bool = False
     message_roles: dict[str, str] = field(default_factory=dict)
     pending_stream_by_message: dict[str, str] = field(default_factory=dict)
     pending_stream_no_id: str = ""
@@ -176,11 +177,58 @@ def terminal_run_event_from_outcome(
     )
 
 
+def recover_post_completion_outcome(
+    outcome: RuntimeThreadOutcome,
+    state: RuntimeThreadRunEventState,
+) -> RuntimeThreadOutcome:
+    """Prefer a streamed completion over a later transport error."""
+
+    if outcome.status != "error" or not state.completed_seen:
+        return outcome
+    assistant_text = outcome.assistant_text or state.assistant_message_text
+    if not isinstance(assistant_text, str) or not assistant_text.strip():
+        return outcome
+    return RuntimeThreadOutcome(
+        status="ok",
+        assistant_text=assistant_text,
+        error=None,
+        backend_thread_id=outcome.backend_thread_id,
+        backend_turn_id=outcome.backend_turn_id,
+    )
+
+
 def _public_terminal_error_message(outcome: RuntimeThreadOutcome) -> str:
     detail = str(outcome.error or "").strip()
     if detail in {"Runtime thread timed out", "Runtime thread interrupted"}:
         return detail
     return "Runtime thread failed"
+
+
+def _extract_status_value(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("type", "status", "state"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                return candidate
+    return None
+
+
+def _status_indicates_successful_completion(
+    status: Any, *, assume_true_when_missing: bool
+) -> bool:
+    normalized = _extract_status_value(status)
+    if not isinstance(normalized, str):
+        return assume_true_when_missing
+    return normalized.lower() in {
+        "completed",
+        "complete",
+        "done",
+        "success",
+        "succeeded",
+        "idle",
+    }
 
 
 async def _parse_runtime_thread_sse(raw_event: str):
@@ -380,13 +428,24 @@ def _normalize_message_event(
         state.last_error_message = str(error_message)
         return [Failed(timestamp=now_iso(), error_message=str(error_message))]
 
-    if method in {"turn/completed", "session.idle"}:
+    if method == "turn/completed":
+        if _status_indicates_successful_completion(
+            params.get("status") or params.get("turn"),
+            assume_true_when_missing=True,
+        ):
+            state.completed_seen = True
+        return []
+
+    if method == "session.idle":
+        state.completed_seen = True
         return []
 
     if method == "session.status":
         status = _coerce_dict(params.get("status"))
-        status_type = str(status.get("type") or status.get("status") or "").strip()
-        if status_type.lower() == "idle":
+        if _status_indicates_successful_completion(
+            status, assume_true_when_missing=False
+        ):
+            state.completed_seen = True
             return []
         return []
 
@@ -881,6 +940,7 @@ def _extract_part_message_id(params: dict[str, Any]) -> Optional[str]:
 __all__ = [
     "RuntimeThreadRunEventState",
     "normalize_runtime_thread_raw_event",
+    "recover_post_completion_outcome",
     "terminal_run_event_from_outcome",
     "_extract_output_delta",
     "_output_delta_type_for_method",

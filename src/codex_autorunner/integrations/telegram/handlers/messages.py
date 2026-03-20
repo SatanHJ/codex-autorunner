@@ -212,6 +212,37 @@ async def _enqueue_or_run_topic_work(
     key: str,
     *,
     chat_id: int,
+    thread_id: Optional[int],
+    placeholder_id: Optional[int],
+    work: Any,
+) -> None:
+    async def _run_wrapped() -> None:
+        await _run_placeholder_wrapped_work(
+            handlers,
+            chat_id=chat_id,
+            placeholder_id=placeholder_id,
+            work=work,
+        )
+
+    async def _run_wrapped_with_typing() -> None:
+        await _run_with_typing_indicator(
+            handlers,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            work=_run_wrapped,
+        )
+
+    enqueue = getattr(handlers, "_enqueue_topic_work", None)
+    if callable(enqueue):
+        enqueue(key, _run_wrapped_with_typing)
+        return
+    await _run_wrapped_with_typing()
+
+
+async def _run_placeholder_wrapped_work(
+    handlers: Any,
+    *,
+    chat_id: int,
     placeholder_id: Optional[int],
     work: Any,
 ) -> None:
@@ -223,11 +254,10 @@ async def _enqueue_or_run_topic_work(
             placeholder_id=placeholder_id,
             work=work,
         )
-    enqueue = getattr(handlers, "_enqueue_topic_work", None)
-    if callable(enqueue):
-        enqueue(key, wrapped)
+    if callable(wrapped):
+        await wrapped()
         return
-    await wrapped()
+    await wrapped
 
 
 async def handle_message(handlers: Any, message: TelegramMessage) -> None:
@@ -361,13 +391,13 @@ async def handle_edited_message(
             placeholder_id=placeholder_id,
         )
 
-    handlers._enqueue_topic_work(
+    await _enqueue_or_run_topic_work(
+        handlers,
         key,
-        handlers._wrap_placeholder_work(
-            chat_id=message.chat_id,
-            placeholder_id=placeholder_id,
-            work=work,
-        ),
+        chat_id=message.chat_id,
+        thread_id=message.thread_id,
+        placeholder_id=placeholder_id,
+        work=work,
     )
 
 
@@ -464,6 +494,7 @@ async def handle_message_inner(
             handlers,
             key,
             chat_id=message.chat_id,
+            thread_id=message.thread_id,
             placeholder_id=placeholder_id,
             work=work,
         )
@@ -545,17 +576,20 @@ async def handle_message_inner(
             await handlers._handle_command(command, message, runtime)
 
         if spec and spec.allow_during_turn:
-            wrapped = handlers._wrap_placeholder_work(
-                chat_id=message.chat_id,
-                placeholder_id=placeholder_id,
-                work=work,
+            handlers._spawn_task(
+                _run_placeholder_wrapped_work(
+                    handlers,
+                    chat_id=message.chat_id,
+                    placeholder_id=placeholder_id,
+                    work=work,
+                )
             )
-            handlers._spawn_task(wrapped())
         else:
             await _enqueue_or_run_topic_work(
                 handlers,
                 key,
                 chat_id=message.chat_id,
+                thread_id=message.thread_id,
                 placeholder_id=placeholder_id,
                 work=work,
             )
@@ -595,13 +629,13 @@ async def handle_message_inner(
                 placeholder_id=placeholder_id,
             )
 
-        handlers._enqueue_topic_work(
+        await _enqueue_or_run_topic_work(
+            handlers,
             key,
-            handlers._wrap_placeholder_work(
-                chat_id=message.chat_id,
-                placeholder_id=placeholder_id,
-                work=work,
-            ),
+            chat_id=message.chat_id,
+            thread_id=message.thread_id,
+            placeholder_id=placeholder_id,
+            work=work,
         )
         return
 
@@ -689,6 +723,7 @@ async def handle_message_inner(
         handlers,
         key,
         chat_id=message.chat_id,
+        thread_id=message.thread_id,
         placeholder_id=placeholder_id,
         work=work,
     )
@@ -984,13 +1019,13 @@ async def buffer_media_batch(
             ) -> None:
                 await handlers._handle_media_batch(msgs, placeholder_id=pid)
 
-            handlers._enqueue_topic_work(
+            await _enqueue_or_run_topic_work(
+                handlers,
                 buffer.topic_key,
-                handlers._wrap_placeholder_work(
-                    chat_id=message.chat_id,
-                    placeholder_id=buffer.placeholder_id,
-                    work=work,
-                ),
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                placeholder_id=buffer.placeholder_id,
+                work=work,
             )
             handlers._media_batch_buffers.pop(key, None)
             buffer = None
@@ -1063,13 +1098,14 @@ async def flush_media_batch_key(handlers: Any, key: str) -> None:
                 buffer.messages, placeholder_id=buffer.placeholder_id
             )
 
-        handlers._enqueue_topic_work(
+        first_message = buffer.messages[0]
+        await _enqueue_or_run_topic_work(
+            handlers,
             buffer.topic_key,
-            handlers._wrap_placeholder_work(
-                chat_id=buffer.messages[0].chat_id,
-                placeholder_id=buffer.placeholder_id,
-                work=work,
-            ),
+            chat_id=first_message.chat_id,
+            thread_id=first_message.thread_id,
+            placeholder_id=buffer.placeholder_id,
+            work=work,
         )
 
 

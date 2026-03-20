@@ -490,7 +490,7 @@ async def test_normal_turn_deletes_progress_placeholder_on_success() -> None:
 
 
 @pytest.mark.anyio
-async def test_normal_turn_append_to_progress_appends_metrics_to_response() -> None:
+async def test_normal_turn_append_to_progress_does_not_emit_separate_metrics() -> None:
     wait = asyncio.Event()
     wait.set()
     client = _ClientStub(turn_wait_events=[wait])
@@ -524,13 +524,90 @@ async def test_normal_turn_append_to_progress_appends_metrics_to_response() -> N
         message, _RuntimeStub(), record=records["10:11"]
     )
 
-    assert captured == {}
+    assert captured == {
+        "chat_id": 10,
+        "message_id": 101,
+        "metrics": "metrics block",
+        "base_text": "",
+    }
     assert handler._deliver_calls[-1]["delete_placeholder_on_delivery"] is True
-    assert handler._deliver_calls[-1]["response"].endswith("\n\nmetrics block")
+    assert "metrics block" not in handler._deliver_calls[-1]["response"]
+    assert handler._outbox_calls == []
 
 
 @pytest.mark.anyio
-async def test_normal_opencode_turn_sends_summary_before_final_response() -> None:
+async def test_normal_turn_separate_metrics_stay_out_of_response() -> None:
+    wait = asyncio.Event()
+    wait.set()
+    client = _ClientStub(turn_wait_events=[wait])
+    record = _record("thread-1")
+    records = {"10:11": record}
+    handler = _HandlerStub(
+        client=client,
+        max_parallel_turns=1,
+        records=records,
+    )
+    metrics_calls: list[dict[str, object]] = []
+
+    async def _send_turn_metrics(**kwargs: object) -> bool:
+        metrics_calls.append(dict(kwargs))
+        return True
+
+    async def _fake_run_turn_and_collect_result(
+        _message: TelegramMessage,
+        _runtime: _RuntimeStub,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            record=record,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            response="final output",
+            placeholder_id=456,
+            elapsed_seconds=12.34,
+            token_usage={
+                "last": {
+                    "totalTokens": 80,
+                    "inputTokens": 60,
+                    "outputTokens": 20,
+                },
+                "modelContextWindow": 100,
+            },
+            transcript_message_id=None,
+            transcript_text=None,
+            intermediate_response="done · agent codex · gpt-4.1-mini · 12s · step 3",
+        )
+
+    handler._run_turn_and_collect_result = _fake_run_turn_and_collect_result  # type: ignore[assignment]
+    handler._send_turn_metrics = _send_turn_metrics  # type: ignore[assignment]
+
+    message = _message(message_id=1, thread_id=11)
+    await handler._handle_normal_message(message, _RuntimeStub(), record=record)
+
+    assert "Token usage:" not in handler._deliver_calls[-1]["response"]
+    assert "Turn time:" not in handler._deliver_calls[-1]["response"]
+    assert metrics_calls == [
+        {
+            "chat_id": 10,
+            "thread_id": 11,
+            "reply_to": 1,
+            "elapsed_seconds": 12.34,
+            "token_usage": {
+                "last": {
+                    "totalTokens": 80,
+                    "inputTokens": 60,
+                    "outputTokens": 20,
+                },
+                "modelContextWindow": 100,
+            },
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_normal_opencode_turn_appends_summary_footer_after_final_response() -> (
+    None
+):
     wait = asyncio.Event()
     wait.set()
     client = _ClientStub(turn_wait_events=[wait])
@@ -573,7 +650,7 @@ async def test_normal_opencode_turn_sends_summary_before_final_response() -> Non
     assert handler._outbox_calls == []
     assert (
         handler._deliver_calls[-1]["response"]
-        == "done · agent opencode · model-x · 1s · step 3\n\nfinal output"
+        == "final output\n\ndone · agent opencode · model-x · 1s · step 3"
     )
     assert handler._deliver_calls[-1]["intermediate_response"] is None
 
@@ -622,8 +699,8 @@ async def test_normal_opencode_turn_drops_no_response_sentinel_when_summary_pres
     await handler._handle_normal_message(message, _RuntimeStub(), record=record)
 
     assert (
-        handler._deliver_calls[-1]["response"]
-        == "done · agent opencode · model-x · 1s · step 3"
+        handler._deliver_calls[-1]["response"] == "(No response text returned.)\n\n"
+        "done · agent opencode · model-x · 1s · step 3"
     )
     assert handler._deliver_calls[-1]["intermediate_response"] is None
 

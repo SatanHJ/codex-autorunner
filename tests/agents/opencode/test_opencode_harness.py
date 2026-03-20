@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from codex_autorunner.agents.opencode.harness import OpenCodeHarness
 from codex_autorunner.agents.registry import get_registered_agents
+from codex_autorunner.core.orchestration.runtime_thread_events import (
+    merge_runtime_thread_raw_events,
+)
 from codex_autorunner.core.sse import SSEEvent
 
 
@@ -179,6 +184,114 @@ async def test_opencode_harness_wait_for_turn_uses_stream_output_over_commentary
     assert result.status == "ok"
     assert result.assistant_text == "final reply"
     assert result.errors == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_progress_event_stream_reuses_pending_turn_collector() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    client = _StubClient(
+        [
+            SSEEvent(
+                event="message.completed",
+                data='{"sessionID":"session-1","info":{"id":"assistant-1","role":"assistant"},"parts":[{"type":"text","text":"hello world"}]}',
+            ),
+            SSEEvent(
+                event="session.status",
+                data='{"sessionID":"session-1","properties":{"status":{"type":"idle"}}}',
+            ),
+        ]
+    )
+    harness = OpenCodeHarness(_StubSupervisor(client))
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="hello",
+        model=None,
+        reasoning=None,
+        approval_mode=None,
+        sandbox_policy=None,
+    )
+
+    streamed: list[Any] = []
+
+    async def _collect_stream() -> None:
+        async for raw_event in harness.progress_event_stream(
+            workspace, "session-1", turn.turn_id
+        ):
+            streamed.append(raw_event)
+
+    stream_task = asyncio.create_task(_collect_stream())
+    result = await harness.wait_for_turn(workspace, "session-1", turn.turn_id)
+    await stream_task
+
+    assert result.status == "ok"
+    assert result.assistant_text == "hello world"
+    assert len(streamed) == 1
+    assert streamed[0] == result.raw_events[0]
+    assert merge_runtime_thread_raw_events(streamed, result.raw_events) == list(
+        result.raw_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_progress_event_stream_replays_buffer_before_live_events() -> (
+    None
+):
+    workspace = Path("/tmp/workspace").resolve()
+    harness = OpenCodeHarness(_StubSupervisor(_StubClient([])))
+
+    turn = await harness.start_turn(
+        workspace,
+        "session-1",
+        prompt="hello",
+        model=None,
+        reasoning=None,
+        approval_mode=None,
+        sandbox_policy=None,
+    )
+    pending = harness._pending_turns[("session-1", turn.turn_id)]
+    pending.progress_event_history.append({"message": {"method": "first"}})
+
+    streamed: list[Any] = []
+
+    async def _collect_stream() -> None:
+        async for raw_event in harness.progress_event_stream(
+            workspace, "session-1", turn.turn_id
+        ):
+            streamed.append(raw_event)
+
+    stream_task = asyncio.create_task(_collect_stream())
+    await asyncio.sleep(0)
+
+    for queue in list(pending.progress_event_subscribers):
+        queue.put_nowait({"message": {"method": "second"}})
+        queue.put_nowait(None)
+
+    await stream_task
+
+    assert streamed == [
+        {"message": {"method": "first"}},
+        {"message": {"method": "second"}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_opencode_harness_progress_event_stream_is_empty_after_pending_turn_cleanup() -> (
+    None
+):
+    harness = OpenCodeHarness(_StubSupervisor(_StubClient([])))
+
+    streamed = [
+        raw_event
+        async for raw_event in harness.progress_event_stream(
+            Path("/tmp/workspace").resolve(), "session-1", "turn-1"
+        )
+    ]
+
+    assert streamed == []
 
 
 @pytest.mark.asyncio

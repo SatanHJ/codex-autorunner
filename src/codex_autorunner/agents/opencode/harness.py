@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
@@ -41,6 +41,10 @@ class _PendingTurnConfig:
     sandbox_policy: Optional[Any]
     question_policy: str
     command_task: Optional[asyncio.Task[Any]] = None
+    progress_event_subscribers: list[asyncio.Queue[Optional[dict[str, Any]]]] = field(
+        default_factory=list
+    )
+    progress_event_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _path_is_within(root: Path, candidate: Path) -> bool:
@@ -504,6 +508,39 @@ class OpenCodeHarness(AgentHarness):
         # wait_for_turn() consumes the OpenCode event stream to collect output.
         return False
 
+    def progress_event_stream(
+        self, workspace_root: Path, conversation_id: str, turn_id: str
+    ) -> AsyncIterator[Any]:
+        pending = self._pending_turns.get((conversation_id, turn_id or ""))
+        if pending is None:
+            _ = workspace_root, conversation_id, turn_id
+
+            async def _empty() -> AsyncIterator[Any]:
+                if False:
+                    yield None
+
+            return _empty()
+
+        queue: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue()
+        for item in pending.progress_event_history:
+            queue.put_nowait(item)
+        pending.progress_event_subscribers.append(queue)
+
+        async def _stream() -> AsyncIterator[Any]:
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    yield item
+            finally:
+                try:
+                    pending.progress_event_subscribers.remove(queue)
+                except ValueError:
+                    pass
+
+        return _stream()
+
     def __init__(self, supervisor: OpenCodeSupervisor) -> None:
         self._supervisor = supervisor
         self._pending_turns: dict[tuple[str, str], _PendingTurnConfig] = {}
@@ -789,17 +826,60 @@ class OpenCodeHarness(AgentHarness):
 
             raw_events: list[dict[str, Any]] = []
 
+            def _publish_progress_event(raw_event: dict[str, Any]) -> None:
+                if not raw_event:
+                    return
+                pending.progress_event_history.append(raw_event)
+                if len(pending.progress_event_history) > 64:
+                    del pending.progress_event_history[:-64]
+                for queue in list(pending.progress_event_subscribers):
+                    queue.put_nowait(raw_event)
+
+            def _close_progress_streams() -> None:
+                for queue in list(pending.progress_event_subscribers):
+                    queue.put_nowait(None)
+
             async def _event_stream() -> AsyncIterator[Any]:
-                async for event in client.stream_events(directory=str(workspace_root)):
-                    payload = event.data
-                    try:
-                        parsed = json.loads(payload) if payload else {}
-                    except json.JSONDecodeError:
-                        parsed = {"raw": payload}
-                    if isinstance(parsed, dict):
-                        wrapped = {"message": {"method": event.event, "params": parsed}}
-                        raw_events.append(wrapped)
-                    yield event
+                try:
+                    async for event in client.stream_events(
+                        directory=str(workspace_root)
+                    ):
+                        payload = event.data
+                        try:
+                            parsed = json.loads(payload) if payload else {}
+                        except json.JSONDecodeError:
+                            parsed = {"raw": payload}
+                        if isinstance(parsed, dict):
+                            wrapped = {
+                                "message": {"method": event.event, "params": parsed}
+                            }
+                            raw_events.append(wrapped)
+                            session_id = extract_session_id(parsed)
+                            status_type = None
+                            if event.event == "session.status":
+                                properties = parsed.get("properties")
+                                if isinstance(properties, dict):
+                                    status = properties.get("status") or {}
+                                else:
+                                    status = parsed.get("status") or {}
+                                if isinstance(status, dict):
+                                    status_type = status.get("type") or status.get(
+                                        "status"
+                                    )
+                            is_idle = event.event == "session.idle" or (
+                                event.event == "session.status"
+                                and isinstance(status_type, str)
+                                and status_type.lower() == "idle"
+                            )
+                            if (
+                                session_id == conversation_id
+                                and not is_idle
+                                and session_id
+                            ):
+                                _publish_progress_event(wrapped)
+                        yield event
+                finally:
+                    _close_progress_streams()
 
             async def _fetch_session() -> Any:
                 statuses = await client.session_status(directory=str(workspace_root))

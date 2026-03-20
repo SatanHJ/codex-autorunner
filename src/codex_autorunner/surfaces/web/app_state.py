@@ -375,6 +375,7 @@ def _build_app_server_supervisor(
 ) -> tuple[Optional[WorkspaceAppServerSupervisor], Optional[float]]:
     if not config.command:
         return None, None
+    command = list(config.command)
 
     def _env_builder(
         workspace_root: Path, _workspace_id: str, state_dir: Path
@@ -382,7 +383,7 @@ def _build_app_server_supervisor(
         state_dir.mkdir(parents=True, exist_ok=True)
         base_env_dict: Optional[dict[str, str]] = dict(base_env) if base_env else None
         return build_app_server_env(
-            config.command,
+            command,
             workspace_root,
             state_dir,
             logger=logger,
@@ -396,7 +397,7 @@ def _build_app_server_supervisor(
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     supervisor = WorkspaceAppServerSupervisor(
-        config.command,
+        command,
         state_root=config.state_root,
         env_builder=_env_builder,
         logger=logger,

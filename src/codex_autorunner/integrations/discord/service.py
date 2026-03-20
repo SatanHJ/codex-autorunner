@@ -1926,9 +1926,9 @@ class DiscordBotService:
     ) -> dict[str, str]:
         repo_config = load_repo_config(workspace_root, hub_path=self._hub_config_path)
         command = (
-            repo_config.app_server.command
+            list(repo_config.app_server.command)
             if repo_config and repo_config.app_server and repo_config.app_server.command
-            else ["codex", "app-server"]
+            else []
         )
         return build_app_server_env(
             command,
@@ -1951,11 +1951,11 @@ class DiscordBotService:
                 hub_path=self._hub_config_path,
             )
             command = (
-                repo_config.app_server.command
+                list(repo_config.app_server.command)
                 if repo_config
                 and repo_config.app_server
                 and repo_config.app_server.command
-                else ["codex", "app-server"]
+                else []
             )
             supervisor = WorkspaceAppServerSupervisor(
                 command,

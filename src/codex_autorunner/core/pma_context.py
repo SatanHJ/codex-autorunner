@@ -2034,6 +2034,85 @@ def _paused_dispatch_resume_invalid_reason(repo_root: Path) -> Optional[str]:
     )
 
 
+def _ticket_flow_has_tickets(repo_root: Path) -> Optional[bool]:
+    ticket_dir = repo_root / ".codex-autorunner" / "tickets"
+    try:
+        return bool(list_ticket_paths(ticket_dir))
+    except Exception as exc:
+        _logger.warning("Could not inspect ticket dir for stale run guard: %s", exc)
+        return None
+
+
+def _terminal_ticket_flow_failure_is_worker_dead(record: FlowRunRecord) -> bool:
+    failure_payload = get_failure_payload(record)
+    if isinstance(failure_payload, Mapping):
+        failure_reason_code = str(
+            failure_payload.get("failure_reason_code") or ""
+        ).strip()
+        failure_class = str(failure_payload.get("failure_class") or "").strip()
+        if failure_reason_code.lower() == "worker_dead":
+            return True
+        if failure_class.lower() == "worker_dead":
+            return True
+
+    state_payload = record.state if isinstance(record.state, Mapping) else {}
+    ticket_engine = state_payload.get("ticket_engine")
+    if isinstance(ticket_engine, Mapping):
+        reason_code = str(ticket_engine.get("reason_code") or "").strip().lower()
+        if reason_code == "worker_dead":
+            return True
+
+    error_message = (
+        record.error_message.strip().lower()
+        if isinstance(record.error_message, str)
+        else ""
+    )
+    return any(
+        needle in error_message
+        for needle in ("worker died", "worker-dead", "worker_dead")
+    )
+
+
+def _stale_terminal_ticket_flow_run_reason(
+    repo_root: Path, record: FlowRunRecord
+) -> Optional[str]:
+    if record.status not in (FlowRunStatus.FAILED, FlowRunStatus.STOPPED):
+        return None
+    if not _terminal_ticket_flow_failure_is_worker_dead(record):
+        return None
+    has_tickets = _ticket_flow_has_tickets(repo_root)
+    if has_tickets is None or has_tickets:
+        return None
+    ticket_dir = repo_root / ".codex-autorunner" / "tickets"
+    return (
+        "Latest failed run is stale; worker died and no tickets remain in "
+        f"{safe_relpath(ticket_dir, repo_root)}"
+    )
+
+
+def _ticket_flow_recommended_actions(
+    *,
+    state: str,
+    record_status: FlowRunStatus,
+    has_pending_dispatch: bool,
+    status_cmd: str,
+    resume_cmd: str,
+    start_cmd: str,
+    stop_cmd: str,
+) -> list[str]:
+    if state == "completed":
+        return [start_cmd]
+    if state == "dead":
+        return [f"{resume_cmd} --force", status_cmd, stop_cmd]
+    if record_status == FlowRunStatus.PAUSED:
+        if has_pending_dispatch:
+            return [resume_cmd, status_cmd, stop_cmd]
+        return [f"{resume_cmd} --force", status_cmd, stop_cmd]
+    if state == "blocked":
+        return [f"{resume_cmd} --force", status_cmd, stop_cmd]
+    return [status_cmd]
+
+
 def _resolve_paused_dispatch_state(
     *,
     repo_root: Path,
@@ -2292,20 +2371,15 @@ def build_ticket_flow_run_state(
     elif record.status == FlowRunStatus.PAUSED:
         blocking_reason = reason_summary or "Waiting for user input"
 
-    recommended_actions: list[str] = []
-    if state == "completed":
-        recommended_actions = [start_cmd]
-    elif state == "dead":
-        recommended_actions = [f"{resume_cmd} --force", status_cmd, stop_cmd]
-    elif record.status == FlowRunStatus.PAUSED:
-        if has_pending_dispatch:
-            recommended_actions = [resume_cmd, status_cmd, stop_cmd]
-        else:
-            recommended_actions = [f"{resume_cmd} --force", status_cmd, stop_cmd]
-    elif state == "blocked":
-        recommended_actions = [f"{resume_cmd} --force", status_cmd, stop_cmd]
-    else:
-        recommended_actions = [status_cmd]
+    recommended_actions = _ticket_flow_recommended_actions(
+        state=state,
+        record_status=record.status,
+        has_pending_dispatch=has_pending_dispatch,
+        status_cmd=status_cmd,
+        resume_cmd=resume_cmd,
+        start_cmd=start_cmd,
+        stop_cmd=stop_cmd,
+    )
 
     return {
         "state": state,
@@ -2377,6 +2451,20 @@ def get_latest_ticket_flow_run_state_with_record(
             "Failed to get latest ticket flow run state for repo %s: %s", repo_id, exc
         )
         return None, None
+
+
+def _ticket_flow_inbox_item_type_and_next_action(
+    *, repo_root: Path, record: FlowRunRecord
+) -> tuple[str, str]:
+    if record.status == FlowRunStatus.RUNNING:
+        health = check_worker_health(repo_root, str(record.id))
+        if health.status in {"dead", "invalid", "mismatch"}:
+            return "worker_dead", "restart_worker"
+    if record.status == FlowRunStatus.FAILED:
+        return "run_failed", "diagnose_or_restart"
+    if record.status == FlowRunStatus.STOPPED:
+        return "run_stopped", "diagnose_or_restart"
+    return "run_state_attention", "inspect_and_resume"
 
 
 def _gather_inbox(
@@ -2469,6 +2557,17 @@ def _gather_inbox(
                         and active_run_id != record_id
                     ):
                         continue
+                    stale_terminal_reason = _stale_terminal_ticket_flow_run_reason(
+                        repo_root, record
+                    )
+                    if stale_terminal_reason:
+                        _logger.info(
+                            "Suppressing stale ticket_flow inbox item for repo %s run %s: %s",
+                            snap.id,
+                            record_id,
+                            stale_terminal_reason,
+                        )
+                        continue
                     if (
                         not run_state.get("attention_required")
                         and not is_terminal_failed
@@ -2509,19 +2608,11 @@ def _gather_inbox(
                             }
                         )
                     else:
-                        item_type = "run_state_attention"
-                        next_action = "inspect_and_resume"
-                        if record.status == FlowRunStatus.RUNNING:
-                            health = check_worker_health(repo_root, str(record.id))
-                            if health.status in {"dead", "invalid", "mismatch"}:
-                                item_type = "worker_dead"
-                                next_action = "restart_worker"
-                        elif record.status == FlowRunStatus.FAILED:
-                            item_type = "run_failed"
-                            next_action = "diagnose_or_restart"
-                        elif record.status == FlowRunStatus.STOPPED:
-                            item_type = "run_stopped"
-                            next_action = "diagnose_or_restart"
+                        item_type, next_action = (
+                            _ticket_flow_inbox_item_type_and_next_action(
+                                repo_root=repo_root, record=record
+                            )
+                        )
                         messages.append(
                             {
                                 **base_item,

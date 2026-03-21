@@ -165,7 +165,7 @@ class ThreadExecutionStore(Protocol):
         self,
         thread_target_id: str,
         *,
-        backend_thread_id: str,
+        backend_thread_id: Optional[str] = None,
         backend_runtime_instance_id: Optional[str] = None,
     ) -> Optional[ThreadTarget]: ...
 
@@ -304,7 +304,7 @@ class OrchestrationThreadService(Protocol):
         self,
         thread_target_id: str,
         *,
-        backend_thread_id: str,
+        backend_thread_id: Optional[str] = None,
         backend_runtime_instance_id: Optional[str] = None,
     ) -> ThreadTarget: ...
 

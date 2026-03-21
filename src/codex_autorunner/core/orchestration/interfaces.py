@@ -55,6 +55,10 @@ class RuntimeThreadHarness(Protocol):
 
     async def ensure_ready(self, workspace_root: Path) -> None: ...
 
+    async def backend_runtime_instance_id(
+        self, workspace_root: Path
+    ) -> Optional[str]: ...
+
     def supports(self, capability: str) -> bool: ...
 
     async def new_conversation(
@@ -141,7 +145,11 @@ class ThreadExecutionStore(Protocol):
     ) -> list[ThreadTarget]: ...
 
     def resume_thread_target(
-        self, thread_target_id: str, *, backend_thread_id: str
+        self,
+        thread_target_id: str,
+        *,
+        backend_thread_id: str,
+        backend_runtime_instance_id: Optional[str] = None,
     ) -> Optional[ThreadTarget]: ...
 
     def archive_thread_target(
@@ -149,7 +157,11 @@ class ThreadExecutionStore(Protocol):
     ) -> Optional[ThreadTarget]: ...
 
     def set_thread_backend_id(
-        self, thread_target_id: str, backend_thread_id: Optional[str]
+        self,
+        thread_target_id: str,
+        backend_thread_id: Optional[str],
+        *,
+        backend_runtime_instance_id: Optional[str] = None,
     ) -> None: ...
 
     def create_execution(
@@ -272,8 +284,16 @@ class OrchestrationThreadService(Protocol):
     ) -> ThreadTarget: ...
 
     def resume_thread_target(
-        self, thread_target_id: str, *, backend_thread_id: str
+        self,
+        thread_target_id: str,
+        *,
+        backend_thread_id: str,
+        backend_runtime_instance_id: Optional[str] = None,
     ) -> ThreadTarget: ...
+
+    async def resolve_backend_runtime_instance_id(
+        self, agent_id: str, workspace_root: Path
+    ) -> Optional[str]: ...
 
     def archive_thread_target(self, thread_target_id: str) -> ThreadTarget: ...
 

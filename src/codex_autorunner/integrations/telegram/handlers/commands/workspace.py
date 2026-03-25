@@ -72,15 +72,15 @@ from ...helpers import (
 )
 from ...state import APPROVAL_MODE_YOLO, normalize_agent
 from ...types import SelectionState
-from .shared import SharedHelpers
-from .workspace_utils import (
+from .agent_model_utils import (
     _extract_opencode_session_path,
     _handle_agent_command,
     _model_list_all_with_agent_compat,
 )
-from .workspace_utils import (
+from .agent_model_utils import (
     _model_list_with_agent_compat as _workspace_model_list_with_agent_compat,
 )
+from .shared import TelegramCommandSupportMixin
 
 if TYPE_CHECKING:
     from ...state import TelegramTopicRecord
@@ -156,7 +156,7 @@ def _telegram_status_base_lines(
     return lines
 
 
-class WorkspaceCommands(SharedHelpers):
+class WorkspaceCommands(TelegramCommandSupportMixin):
     def _resolve_workspace_path(
         self,
         record: Optional["TelegramTopicRecord"],

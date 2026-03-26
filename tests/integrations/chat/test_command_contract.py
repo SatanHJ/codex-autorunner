@@ -98,3 +98,25 @@ def test_command_contract_status_and_mapping_invariants() -> None:
     assert by_id["car.agent"].status == "stable"
     assert by_id["car.flow.status"].status == "partial"
     assert by_id["car.review"].status == "partial"
+    assert by_id["car.mcp"].status == "partial"
+
+
+def test_command_contract_discord_metadata_is_present_for_registered_paths() -> None:
+    for entry in COMMAND_CONTRACT:
+        if not entry.discord_paths:
+            assert entry.discord_ack_policy is None
+            assert entry.discord_exposure is None
+            continue
+        assert entry.discord_ack_policy in {
+            "immediate",
+            "defer_ephemeral",
+            "defer_public",
+            "defer_component_update",
+        }
+        assert entry.discord_ack_timing in {"dispatch", "post_private_preflight"}
+        assert entry.discord_exposure in {"public", "operator"}
+
+    by_id = {entry.id: entry for entry in COMMAND_CONTRACT}
+    assert by_id["car.flow.status"].discord_ack_timing == "post_private_preflight"
+    assert by_id["car.flow.start"].discord_ack_timing == "post_private_preflight"
+    assert by_id["car.flow.restart"].discord_ack_timing == "post_private_preflight"

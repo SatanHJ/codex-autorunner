@@ -3,6 +3,7 @@ import { parseAppServerEvent, resetOpenCodeEventState } from "./agentEvents.js";
 import { summarizeEvents, renderCompactSummary, COMPACT_MAX_ACTIONS, COMPACT_MAX_TEXT_LENGTH } from "./eventSummarizer.js";
 import { saveChatHistory, loadChatHistory } from "./docChatStorage.js";
 import { renderMarkdown } from "./messages.js";
+import { t } from "./i18n.js";
 function getElements(prefix) {
     return {
         input: document.getElementById(`${prefix}-input`),
@@ -76,7 +77,7 @@ export function createDocChat(config) {
             link.removeAttribute("target");
             link.setAttribute("rel", "noopener");
             if (!link.title)
-                link.title = "Download file";
+                link.title = t("common.downloadFile");
         }
     }
     function saveHistory() {
@@ -184,7 +185,7 @@ export function createDocChat(config) {
             renderCompactEvents();
             if (eventsToggle) {
                 eventsToggle.classList.toggle("hidden", !hasEvents);
-                eventsToggle.textContent = "Show details";
+                eventsToggle.textContent = t("common.showDetails");
             }
             return;
         }
@@ -194,12 +195,14 @@ export function createDocChat(config) {
         if (eventsToggle) {
             if (compactMode) {
                 eventsToggle.classList.toggle("hidden", !hasEvents);
-                eventsToggle.textContent = "Show compact";
+                eventsToggle.textContent = t("common.showCompact");
             }
             else {
                 const hiddenCount = Math.max(0, state.events.length - showCount);
                 eventsToggle.classList.toggle("hidden", hiddenCount === 0);
-                eventsToggle.textContent = expanded ? "Show recent" : `Show more (${hiddenCount})`;
+                eventsToggle.textContent = expanded
+                    ? t("common.showRecent")
+                    : `${t("common.showMore")} (${hiddenCount})`;
             }
         }
         eventsList.innerHTML = "";
@@ -207,7 +210,7 @@ export function createDocChat(config) {
             const empty = document.createElement("div");
             empty.className =
                 config.styling.eventsWaitingClass || config.styling.eventsEmptyClass || "chat-events-empty";
-            empty.textContent = "Processing...";
+            empty.textContent = t("common.processing");
             eventsList.appendChild(empty);
             return;
         }
@@ -253,7 +256,7 @@ export function createDocChat(config) {
         const text = state.events.length ? renderCompactSummary(summary) : "";
         const wrapper = document.createElement("pre");
         wrapper.className = "chat-events-compact";
-        wrapper.textContent = text || (state.status === "running" ? "Processing..." : "No events yet.");
+        wrapper.textContent = text || (state.status === "running" ? t("common.processing") : t("common.noEventsYet"));
         eventsList.appendChild(wrapper);
     }
     function renderMessages() {

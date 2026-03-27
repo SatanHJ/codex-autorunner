@@ -21,6 +21,7 @@ import {
   updateRestartNotice,
   updateTargetOptionsFromResponse,
 } from "./updateTargets.js";
+import { t } from "./i18n.js";
 
 interface HubTicketFlow {
   status: string;
@@ -2753,13 +2754,13 @@ function applyHubPanelState(openPanel: HubOpenPanel): void {
     hubRepoPanelSummaryEl.setAttribute("aria-expanded", reposOpen ? "true" : "false");
   }
   if (hubRepoPanelStateEl) {
-    hubRepoPanelStateEl.textContent = reposOpen ? "Expanded" : "Show panel";
+    hubRepoPanelStateEl.textContent = reposOpen ? t("hub.expanded") : t("hub.showPanel");
   }
   if (hubAgentPanelSummaryEl) {
     hubAgentPanelSummaryEl.setAttribute("aria-expanded", agentsOpen ? "true" : "false");
   }
   if (hubAgentPanelStateEl) {
-    hubAgentPanelStateEl.textContent = agentsOpen ? "Expanded" : "Show panel";
+    hubAgentPanelStateEl.textContent = agentsOpen ? t("hub.expanded") : t("hub.showPanel");
   }
 }
 

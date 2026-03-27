@@ -2,6 +2,7 @@ import { parseAppServerEvent, resetOpenCodeEventState, type ParsedAgentEvent, ty
 import { summarizeEvents, renderCompactSummary, COMPACT_MAX_ACTIONS, COMPACT_MAX_TEXT_LENGTH } from "./eventSummarizer.js";
 import { saveChatHistory, loadChatHistory, type ChatStorageConfig } from "./docChatStorage.js";
 import { renderMarkdown } from "./messages.js";
+import { t } from "./i18n.js";
 
 export type ChatStatus = "idle" | "running" | "done" | "error" | "interrupted";
 
@@ -192,7 +193,7 @@ export function createDocChat(config: ChatConfig): DocChatInstance {
       // Ensure downloads happen in-place (no new tab).
       link.removeAttribute("target");
       link.setAttribute("rel", "noopener");
-      if (!link.title) link.title = "Download file";
+      if (!link.title) link.title = t("common.downloadFile");
     }
   }
 
@@ -304,7 +305,7 @@ export function createDocChat(config: ChatConfig): DocChatInstance {
       renderCompactEvents();
       if (eventsToggle) {
         eventsToggle.classList.toggle("hidden", !hasEvents);
-        eventsToggle.textContent = "Show details";
+        eventsToggle.textContent = t("common.showDetails");
       }
       return;
     }
@@ -316,11 +317,13 @@ export function createDocChat(config: ChatConfig): DocChatInstance {
     if (eventsToggle) {
       if (compactMode) {
         eventsToggle.classList.toggle("hidden", !hasEvents);
-        eventsToggle.textContent = "Show compact";
+        eventsToggle.textContent = t("common.showCompact");
       } else {
         const hiddenCount = Math.max(0, state.events.length - showCount);
         eventsToggle.classList.toggle("hidden", hiddenCount === 0);
-        eventsToggle.textContent = expanded ? "Show recent" : `Show more (${hiddenCount})`;
+        eventsToggle.textContent = expanded
+          ? t("common.showRecent")
+          : `${t("common.showMore")} (${hiddenCount})`;
       }
     }
 
@@ -330,7 +333,7 @@ export function createDocChat(config: ChatConfig): DocChatInstance {
       const empty = document.createElement("div");
       empty.className =
         config.styling.eventsWaitingClass || config.styling.eventsEmptyClass || "chat-events-empty";
-      empty.textContent = "Processing...";
+      empty.textContent = t("common.processing");
       eventsList.appendChild(empty);
       return;
     }
@@ -383,7 +386,9 @@ export function createDocChat(config: ChatConfig): DocChatInstance {
     const text = state.events.length ? renderCompactSummary(summary) : "";
     const wrapper = document.createElement("pre");
     wrapper.className = "chat-events-compact";
-    wrapper.textContent = text || (state.status === "running" ? "Processing..." : "No events yet.");
+    wrapper.textContent = text || (
+      state.status === "running" ? t("common.processing") : t("common.noEventsYet")
+    );
     eventsList.appendChild(wrapper);
   }
 

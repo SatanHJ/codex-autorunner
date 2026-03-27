@@ -5,6 +5,7 @@ import { HUB_BASE } from "./env.js";
 import { preserveScroll } from "./preserve.js";
 import { initNotificationBell } from "./notificationBell.js";
 import { describeUpdateTarget, getUpdateTarget, includesWebUpdateTarget, normalizeUpdateTarget, updateRestartNotice, updateTargetOptionsFromResponse, } from "./updateTargets.js";
+import { t } from "./i18n.js";
 function nonPmaChatBoundThreadCount(repo) {
     if (repo.non_pma_chat_bound_thread_count != null) {
         return Math.max(0, Number(repo.non_pma_chat_bound_thread_count || 0));
@@ -2155,13 +2156,13 @@ function applyHubPanelState(openPanel) {
         hubRepoPanelSummaryEl.setAttribute("aria-expanded", reposOpen ? "true" : "false");
     }
     if (hubRepoPanelStateEl) {
-        hubRepoPanelStateEl.textContent = reposOpen ? "Expanded" : "Show panel";
+        hubRepoPanelStateEl.textContent = reposOpen ? t("hub.expanded") : t("hub.showPanel");
     }
     if (hubAgentPanelSummaryEl) {
         hubAgentPanelSummaryEl.setAttribute("aria-expanded", agentsOpen ? "true" : "false");
     }
     if (hubAgentPanelStateEl) {
-        hubAgentPanelStateEl.textContent = agentsOpen ? "Expanded" : "Show panel";
+        hubAgentPanelStateEl.textContent = agentsOpen ? t("hub.expanded") : t("hub.showPanel");
     }
 }
 function toggleHubPanel(panel) {

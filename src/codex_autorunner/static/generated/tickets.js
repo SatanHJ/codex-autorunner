@@ -11,6 +11,7 @@ import { summarizeEvents, renderCompactSummary, COMPACT_MAX_TEXT_LENGTH } from "
 import { refreshBell, renderMarkdown } from "./messages.js";
 import { preserveScroll } from "./preserve.js";
 import { createSmartRefresh } from "./smartRefresh.js";
+import { t } from "./i18n.js";
 function formatDispatchTime(ts) {
     if (!ts)
         return "";
@@ -647,14 +648,14 @@ function setLiveOutputStatus(status) {
     statusEl.className = "ticket-live-output-status";
     switch (status) {
         case "disconnected":
-            statusEl.textContent = "Disconnected";
+            statusEl.textContent = t("tickets.disconnected");
             break;
         case "connected":
-            statusEl.textContent = "Connected";
+            statusEl.textContent = t("tickets.connected");
             statusEl.classList.add("connected");
             break;
         case "streaming":
-            statusEl.textContent = "Streaming";
+            statusEl.textContent = t("tickets.streaming");
             statusEl.classList.add("streaming");
             break;
     }
@@ -1717,8 +1718,8 @@ async function loadTicketFlow(ctx) {
             const busy = latest?.status === "running" || latest?.status === "pending";
             // Disable only if busy; bootstrap will create initial ticket when missing
             bootstrapBtn.disabled = busy;
-            bootstrapBtn.textContent = busy ? "Running…" : "Start Ticket Flow";
-            bootstrapBtn.title = busy ? "Ticket flow in progress" : "";
+            bootstrapBtn.textContent = busy ? t("tickets.runningIndicator") : t("tickets.start");
+            bootstrapBtn.title = busy ? t("tickets.inProgress") : "";
         }
         // Show restart button when flow is paused, stopping, or in terminal state (allows starting fresh)
         const { restartBtn, overflowRestart } = els();
@@ -1781,7 +1782,7 @@ async function bootstrapTicketFlow() {
         return;
     }
     setButtonsDisabled(true);
-    bootstrapBtn.textContent = "Checking…";
+    bootstrapBtn.textContent = t("tickets.checking");
     const startFlow = async () => {
         const res = (await api("/api/flows/ticket_flow/bootstrap", {
             method: "POST",
@@ -1908,7 +1909,7 @@ async function bootstrapTicketFlow() {
         flash(err.message || "Failed to start ticket flow", "error");
     }
     finally {
-        bootstrapBtn.textContent = "Start Ticket Flow";
+        bootstrapBtn.textContent = t("tickets.start");
         setButtonsDisabled(false);
     }
 }
@@ -1925,7 +1926,7 @@ async function resumeTicketFlow() {
         return;
     }
     setButtonsDisabled(true);
-    resumeBtn.textContent = "Resuming…";
+    resumeBtn.textContent = t("tickets.resuming");
     try {
         await api(`/api/flows/${currentRunId}/resume`, { method: "POST", body: {} });
         flash("Ticket flow resumed");
@@ -1935,7 +1936,7 @@ async function resumeTicketFlow() {
         flash(err.message || "Failed to resume", "error");
     }
     finally {
-        resumeBtn.textContent = "Resume";
+        resumeBtn.textContent = t("tickets.resume");
         setButtonsDisabled(false);
     }
 }
@@ -1963,7 +1964,7 @@ async function stopTicketFlow() {
         return;
     }
     setButtonsDisabled(true);
-    stopBtn.textContent = "Stopping…";
+    stopBtn.textContent = t("tickets.stopping");
     try {
         await api(`/api/flows/${currentRunId}/stop`, { method: "POST", body: {} });
         flash("Ticket flow stopping");
@@ -1973,7 +1974,7 @@ async function stopTicketFlow() {
         flash(err.message || "Failed to stop ticket flow", "error");
     }
     finally {
-        stopBtn.textContent = "Stop";
+        stopBtn.textContent = t("tickets.stop");
         setButtonsDisabled(false);
     }
 }
@@ -1990,7 +1991,7 @@ async function recoverTicketFlow() {
         return;
     }
     setButtonsDisabled(true);
-    recoverBtn.textContent = "Recovering…";
+    recoverBtn.textContent = t("tickets.recovering");
     try {
         await api(`/api/flows/${currentRunId}/reconcile`, { method: "POST", body: {} });
         flash("Flow reconciled");
@@ -2000,7 +2001,7 @@ async function recoverTicketFlow() {
         flash(err.message || "Failed to recover ticket flow", "error");
     }
     finally {
-        recoverBtn.textContent = "Recover";
+        recoverBtn.textContent = t("tickets.recover");
         setButtonsDisabled(false);
     }
 }
@@ -2021,7 +2022,7 @@ async function restartTicketFlow() {
         return;
     }
     setButtonsDisabled(true);
-    restartBtn.textContent = "Restarting…";
+    restartBtn.textContent = t("tickets.restarting");
     try {
         // Stop the current run first if it exists
         if (currentRunId) {
@@ -2041,7 +2042,7 @@ async function restartTicketFlow() {
         flash(err.message || "Failed to restart ticket flow", "error");
     }
     finally {
-        restartBtn.textContent = "Restart";
+        restartBtn.textContent = t("tickets.restart");
         setButtonsDisabled(false);
     }
 }
@@ -2065,7 +2066,7 @@ async function archiveTicketFlow() {
         }
     }
     setButtonsDisabled(true);
-    archiveBtn.textContent = "Archiving…";
+    archiveBtn.textContent = t("tickets.archiving");
     try {
         const res = (await api(`/api/flows/${currentRunId}/archive?force=${force}`, {
             method: "POST",
@@ -2106,7 +2107,7 @@ async function archiveTicketFlow() {
         if (recoverBtn)
             recoverBtn.style.display = "none";
         if (reason) {
-            reason.textContent = "No ticket flow run yet.";
+            reason.textContent = t("tickets.noRunYet");
             reason.classList.remove("has-details");
         }
         renderDispatchHistory(null, null);
@@ -2118,7 +2119,7 @@ async function archiveTicketFlow() {
         // Update button states for no active run
         if (bootstrapBtn) {
             bootstrapBtn.disabled = false;
-            bootstrapBtn.textContent = "Start Ticket Flow";
+            bootstrapBtn.textContent = t("tickets.start");
             bootstrapBtn.title = "";
         }
         if (resumeBtn)
@@ -2143,7 +2144,7 @@ async function archiveTicketFlow() {
     }
     finally {
         if (archiveBtn) {
-            archiveBtn.textContent = "Archive Flow";
+            archiveBtn.textContent = t("tickets.archiveFlow");
         }
         setButtonsDisabled(false);
     }

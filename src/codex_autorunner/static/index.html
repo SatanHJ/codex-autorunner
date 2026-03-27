@@ -31,6 +31,13 @@
         <span class="hub-version" id="hub-version">v–</span>
       </div>
       <div class="hub-hero-actions">
+        <div class="lang-switch">
+          <label class="lang-switch-label" for="hub-language-select">Language</label>
+          <select class="lang-switch-select" id="hub-language-select" data-car-language-select>
+            <option value="en">English</option>
+            <option value="zh-CN">简体中文</option>
+          </select>
+        </div>
         <button class="primary sm" id="hub-new-repo">+ New repo</button>
         <button class="ghost sm" id="hub-new-agent">+ Agent</button>
         <button class="ghost sm" id="hub-refresh">Refresh</button>
@@ -131,6 +138,13 @@
         <span class="hub-version" id="pma-version">v–</span>
       </div>
       <div class="hub-hero-actions pma-hero-actions">
+        <div class="lang-switch">
+          <label class="lang-switch-label" for="pma-language-select">Language</label>
+          <select class="lang-switch-select" id="pma-language-select" data-car-language-select>
+            <option value="en">English</option>
+            <option value="zh-CN">简体中文</option>
+          </select>
+        </div>
         <button class="ghost sm icon-btn notification-bell" id="pma-notification-bell" title="Run Dispatches">
           <svg class="notification-bell-icon" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M6 9.5a6 6 0 0 1 12 0v3.5l1.6 2.2H4.4L6 13z" />
@@ -264,6 +278,15 @@
       <span class="nav-brand">CAR</span>
       <div class="tabs">
         <!-- Tabs will be injected here by tabs.js -->
+      </div>
+      <div class="nav-actions">
+        <div class="lang-switch lang-switch-nav">
+          <label class="lang-switch-label" for="repo-language-select">Language</label>
+          <select class="lang-switch-select" id="repo-language-select" data-car-language-select>
+            <option value="en">English</option>
+            <option value="zh-CN">简体中文</option>
+          </select>
+        </div>
       </div>
     </nav>
     <main>
@@ -689,7 +712,7 @@
           <!-- Live Agent Output Panel -->
           <div class="ticket-live-output-panel" id="ticket-live-output-panel">
             <div class="ticket-live-output-header">
-              <span class="ticket-live-output-title">Agent</span>
+              <span class="ticket-live-output-title" id="ticket-live-output-title">Agent</span>
               <span class="ticket-live-output-status" id="ticket-live-output-status">Disconnected</span>
               <span class="ticket-live-output-spacer"></span>
               <button class="ticket-live-output-view-toggle" id="ticket-live-output-view-toggle"

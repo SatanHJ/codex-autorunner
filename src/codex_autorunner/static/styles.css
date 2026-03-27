@@ -426,6 +426,35 @@ body {
   display: none;
 }
 
+.lang-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.lang-switch-label {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.lang-switch-select {
+  min-width: 110px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.lang-switch-nav .lang-switch-label {
+  display: none;
+}
+
 .inbox-btn {
   position: relative;
 }

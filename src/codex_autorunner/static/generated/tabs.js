@@ -1,17 +1,26 @@
 // GENERATED FILE - do not edit directly. Source: static_src/
 import { publish } from "./bus.js";
 import { escapeHtml, getUrlParams, updateUrlParams } from "./utils.js";
+import { onLanguageChange, t } from "./i18n.js";
 const tabs = [];
 const hamburgerActions = [];
 let hamburgerMenuOpen = false;
 let hamburgerMenuEl = null;
 let hamburgerBtnEl = null;
 let hamburgerBackdropEl = null;
+let languageSyncBound = false;
 export function registerTab(id, label, opts = {}) {
-    tabs.push({ id, label, hidden: Boolean(opts.hidden), menuTab: Boolean(opts.menuTab), icon: opts.icon });
+    tabs.push({
+        id,
+        label,
+        i18nKey: opts.i18nKey,
+        hidden: Boolean(opts.hidden),
+        menuTab: Boolean(opts.menuTab),
+        icon: opts.icon,
+    });
 }
-export function registerHamburgerAction(id, label, icon, onClick) {
-    hamburgerActions.push({ id, label, icon, onClick });
+export function registerHamburgerAction(id, label, icon, onClick, opts = {}) {
+    hamburgerActions.push({ id, label, i18nKey: opts.i18nKey, icon, onClick });
 }
 let setActivePanelFn = null;
 let pendingActivate = null;
@@ -49,6 +58,36 @@ function updateHamburgerActiveState(activeTabId) {
     const isMenuTabActive = tabs.some((t) => t.menuTab && t.id === activeTabId);
     hamburgerBtnEl?.classList.toggle("has-active", isMenuTabActive);
 }
+function renderLabel(label, i18nKey) {
+    return escapeHtml(i18nKey ? t(i18nKey) : label);
+}
+function refreshRenderedLabels() {
+    const container = document.querySelector(".tabs");
+    container?.querySelectorAll(".tab").forEach((button) => {
+        const tab = tabs.find((entry) => entry.id === button.dataset.target);
+        const label = button.querySelector(".tab-label");
+        if (tab && label) {
+            label.textContent = tab.i18nKey ? t(tab.i18nKey) : tab.label;
+        }
+    });
+    hamburgerMenuEl?.querySelectorAll(".hamburger-item[data-target]").forEach((item) => {
+        const tab = tabs.find((entry) => entry.id === item.dataset.target);
+        const label = item.querySelector("span:last-child");
+        if (tab && label) {
+            label.textContent = tab.i18nKey ? t(tab.i18nKey) : tab.label;
+        }
+    });
+    hamburgerMenuEl?.querySelectorAll(".hamburger-item[data-action]").forEach((item) => {
+        const action = hamburgerActions.find((entry) => entry.id === item.dataset.action);
+        const label = item.querySelector("span:last-child");
+        if (action && label) {
+            label.textContent = action.i18nKey ? t(action.i18nKey) : action.label;
+        }
+    });
+    if (hamburgerBtnEl) {
+        hamburgerBtnEl.setAttribute("aria-label", t("nav.more"));
+    }
+}
 export function initTabs(defaultTab = "analytics") {
     const container = document.querySelector(".tabs");
     const navBar = document.querySelector(".nav-bar");
@@ -76,7 +115,7 @@ export function initTabs(defaultTab = "analytics") {
         btn.className = "tab";
         btn.dataset.target = tab.id;
         btn.innerHTML = `
-      <span class="tab-label">${escapeHtml(tab.label)}</span>
+      <span class="tab-label">${renderLabel(tab.label, tab.i18nKey)}</span>
       <span class="badge hidden" id="tab-badge-${tab.id}"></span>
     `;
         btn.addEventListener("click", () => setActivePanel(tab.id));
@@ -89,7 +128,7 @@ export function initTabs(defaultTab = "analytics") {
         // Hamburger button
         const btn = document.createElement("button");
         btn.className = "hamburger-btn";
-        btn.setAttribute("aria-label", "More options");
+        btn.setAttribute("aria-label", t("nav.more"));
         btn.setAttribute("aria-expanded", "false");
         btn.innerHTML = `
       <span class="hamburger-icon">
@@ -111,7 +150,7 @@ export function initTabs(defaultTab = "analytics") {
             item.dataset.target = tab.id;
             item.setAttribute("role", "menuitem");
             const iconHtml = tab.icon ? `<span class="hamburger-item-icon">${tab.icon}</span>` : "";
-            item.innerHTML = `${iconHtml}<span>${escapeHtml(tab.label)}</span>`;
+            item.innerHTML = `${iconHtml}<span>${renderLabel(tab.label, tab.i18nKey)}</span>`;
             item.addEventListener("click", () => {
                 setActivePanel(tab.id);
                 closeHamburgerMenu();
@@ -131,7 +170,7 @@ export function initTabs(defaultTab = "analytics") {
             item.dataset.action = action.id;
             item.setAttribute("role", "menuitem");
             const iconHtml = action.icon ? `<span class="hamburger-item-icon">${action.icon}</span>` : "";
-            item.innerHTML = `${iconHtml}<span>${escapeHtml(action.label)}</span>`;
+            item.innerHTML = `${iconHtml}<span>${renderLabel(action.label, action.i18nKey)}</span>`;
             item.addEventListener("click", () => {
                 action.onClick();
                 closeHamburgerMenu();
@@ -201,5 +240,11 @@ export function initTabs(defaultTab = "analytics") {
         const id = pendingActivate;
         pendingActivate = null;
         setActivePanel(id);
+    }
+    if (!languageSyncBound) {
+        onLanguageChange(() => {
+            refreshRenderedLabels();
+        });
+        languageSyncBound = true;
     }
 }

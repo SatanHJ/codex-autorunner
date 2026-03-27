@@ -21,6 +21,7 @@ import { initDashboard } from "./dashboard.js";
 import { initArchive } from "./archive.js";
 import { initPMA, setPMARefreshActive } from "./pma.js";
 import { initNotifications } from "./notifications.js";
+import { initI18n, onLanguageChange, t } from "./i18n.js";
 
 let pmaInitialized = false;
 
@@ -124,7 +125,7 @@ async function initHubShell(): Promise<void> {
     pmaBtns.forEach((btn) => {
       btn.disabled = true;
       btn.setAttribute("aria-disabled", "true");
-      btn.title = "Enable PMA in config to use Project Manager";
+      btn.title = t("hub.enablePmaHint");
       btn.classList.add("hidden");
       btn.classList.remove("active");
       btn.setAttribute("aria-selected", "false");
@@ -149,9 +150,13 @@ async function initRepoShell(): Promise<void> {
       const backBtn = document.createElement("a");
       backBtn.href = HUB_BASE || "/";
       backBtn.className = "hub-back-btn";
-      backBtn.textContent = "← Hub";
-      backBtn.title = "Back to Hub";
+      backBtn.textContent = t("nav.backHub");
+      backBtn.title = t("nav.backHubTitle");
       navBar.insertBefore(backBtn, navBar.firstChild);
+      onLanguageChange(() => {
+        backBtn.textContent = t("nav.backHub");
+        backBtn.title = t("nav.backHubTitle");
+      });
     }
     const brand = document.querySelector(".nav-brand");
     if (brand) {
@@ -164,15 +169,25 @@ async function initRepoShell(): Promise<void> {
 
   const defaultTab = REPO_ID ? "tickets" : "analytics";
 
-  registerTab("tickets", "Tickets");
-  registerTab("inbox", "Inbox");
-  registerTab("contextspace", "Contextspace");
-  registerTab("terminal", "Terminal");
+  registerTab("tickets", "Tickets", { i18nKey: "tabs.tickets" });
+  registerTab("inbox", "Inbox", { i18nKey: "tabs.inbox" });
+  registerTab("contextspace", "Contextspace", { i18nKey: "tabs.contextspace" });
+  registerTab("terminal", "Terminal", { i18nKey: "tabs.terminal" });
   // Menu tabs (shown in hamburger menu)
-  registerTab("analytics", "Analytics", { menuTab: true, icon: "📊" });
-  registerTab("archive", "Archive", { menuTab: true, icon: "📦" });
+  registerTab("analytics", "Analytics", {
+    menuTab: true,
+    icon: "📊",
+    i18nKey: "tabs.analytics",
+  });
+  registerTab("archive", "Archive", {
+    menuTab: true,
+    icon: "📦",
+    i18nKey: "tabs.archive",
+  });
   // Settings action in hamburger menu
-  registerHamburgerAction("settings", "Settings", "⚙", () => openRepoSettings());
+  registerHamburgerAction("settings", "Settings", "⚙", () => openRepoSettings(), {
+    i18nKey: "nav.settings",
+  });
 
   const initializedTabs = new Set<string>();
   const lazyInit = (tabId: string): void => {
@@ -239,6 +254,7 @@ function dismissBootLoader(): void {
 }
 
 function bootstrap() {
+  initI18n();
   dismissBootLoader();
 
   if (!REPO_ID) {

@@ -83,6 +83,9 @@
       "path": "generated/hub.js"
     },
     {
+      "path": "generated/i18n.js"
+    },
+    {
       "path": "generated/liveUpdates.js"
     },
     {

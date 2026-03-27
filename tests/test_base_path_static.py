@@ -132,3 +132,31 @@ def test_query_token_overrides_stale_cookie_for_navigation(
             == "secret"
         )
         assert client.get("/car/repos/demo/").status_code == 200
+
+
+def test_redirected_query_token_persists_for_repo_api_and_websocket(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _create_auth_enabled_hub_app(tmp_path, monkeypatch)
+
+    with TestClient(app, follow_redirects=True) as client:
+        landing = client.get("/?token=secret")
+
+        assert landing.status_code == 200
+        assert [response.status_code for response in landing.history] == [308]
+        assert landing.history[0].headers.get("location") == "/car/?token=secret"
+        assert (
+            client.cookies.get(
+                "car_auth_token",
+                domain="testserver.local",
+                path="/car",
+            )
+            == "secret"
+        )
+
+        repo_api = client.get("/car/repos/demo/api/version")
+
+        assert repo_api.status_code == 200
+
+        with client.websocket_connect("/car/repos/demo/api/terminal") as ws:
+            ws.close()

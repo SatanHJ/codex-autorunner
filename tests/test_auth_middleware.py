@@ -69,3 +69,18 @@ def test_auth_middleware_extracts_ws_protocol_b64_token() -> None:
         ]
     )
     assert middleware._extract_ws_protocol_token(scope) == raw
+
+
+def test_auth_middleware_extracts_cookie_token() -> None:
+    middleware = AuthTokenMiddleware(lambda *_: None, token="token")
+    scope = _scope("/hub/repos")
+    scope["headers"] = [(b"cookie", b"other=1; car_auth_token=secret")]
+    assert middleware._extract_cookie_token(scope) == "secret"
+
+
+def test_auth_middleware_prefers_query_token_over_cookie() -> None:
+    middleware = AuthTokenMiddleware(lambda *_: None, token="token")
+    scope = _scope("/hub/repos")
+    scope["headers"] = [(b"cookie", b"car_auth_token=stale")]
+    scope["query_string"] = b"token=fresh"
+    assert middleware._extract_request_token(scope) == ("fresh", "query")

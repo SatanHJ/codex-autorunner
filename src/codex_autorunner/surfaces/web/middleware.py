@@ -6,6 +6,7 @@ import hmac
 import logging
 import time
 import uuid
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.responses import RedirectResponse, Response
@@ -16,6 +17,8 @@ from ...core.request_context import reset_request_id, set_request_id
 from .static_assets import security_headers
 
 logger = logging.getLogger("codex_autorunner.web.middleware")
+
+AUTH_TOKEN_COOKIE_KEY = "car_auth_token"
 
 
 class BasePathRouterMiddleware:
@@ -208,6 +211,24 @@ class AuthTokenMiddleware:
         token_values = parsed.get("token") or []
         return token_values[0] if token_values else None
 
+    def _extract_cookie_token(self, scope) -> str | None:
+        headers: dict[bytes, bytes] = {
+            k.lower(): v for k, v in (scope.get("headers") or [])
+        }
+        raw = headers.get(b"cookie")
+        if not raw:
+            return None
+        try:
+            parsed = SimpleCookie()
+            parsed.load(raw.decode("latin-1"))
+        except (CookieError, UnicodeDecodeError):
+            return None
+        morsel = parsed.get(AUTH_TOKEN_COOKIE_KEY)
+        if morsel is None:
+            return None
+        value = morsel.value.strip()
+        return value or None
+
     def _extract_ws_protocol_token(self, scope) -> str | None:
         if scope.get("type") != "websocket":
             return None
@@ -243,6 +264,58 @@ class AuthTokenMiddleware:
                     return token
         return None
 
+    def _normalize_cookie_path(self, base: str) -> str:
+        if not base or base == "/":
+            return ""
+        normalized = base if base.startswith("/") else f"/{base}"
+        while normalized.endswith("/") and len(normalized) > 1:
+            normalized = normalized[:-1]
+        return "" if normalized == "/" else normalized
+
+    def _detect_cookie_path(self, scope) -> str:
+        path = self._full_path(scope)
+        prefixes = ("/repos/", "/hub/", "/api/", "/static/", "/cat/")
+        idx = -1
+        for prefix in prefixes:
+            found = path.find(prefix)
+            if found == 0:
+                return "/"
+            if found > 0 and (idx == -1 or found < idx):
+                idx = found
+        if idx > 0:
+            return self._normalize_cookie_path(path[:idx]) or "/"
+        parts = [segment for segment in path.split("/") if segment]
+        if parts:
+            return self._normalize_cookie_path(f"/{parts[0]}") or "/"
+        return "/"
+
+    def _build_auth_cookie(self, token: str, scope) -> str:
+        cookie = SimpleCookie()
+        cookie[AUTH_TOKEN_COOKIE_KEY] = token
+        morsel = cookie[AUTH_TOKEN_COOKIE_KEY]
+        morsel["path"] = self._detect_cookie_path(scope)
+        morsel["httponly"] = True
+        morsel["samesite"] = "Strict"
+        if (scope.get("scheme") or "").lower() == "https":
+            morsel["secure"] = True
+        return cookie.output(header="").strip()
+
+    def _extract_request_token(self, scope) -> tuple[str | None, str | None]:
+        token = self._extract_header_token(scope)
+        if token is not None:
+            return token, "header"
+        if scope.get("type") == "websocket":
+            token = self._extract_ws_protocol_token(scope)
+            if token is not None:
+                return token, "websocket"
+        token = self._extract_query_token(scope)
+        if token is not None:
+            return token, "query"
+        token = self._extract_cookie_token(scope)
+        if token is not None:
+            return token, "cookie"
+        return None, None
+
     async def _reject_http(self, scope, receive, send) -> None:
         response = Response(
             content="Unauthorized",
@@ -255,21 +328,49 @@ class AuthTokenMiddleware:
         await send({"type": "websocket.close", "code": 1008})
 
     async def __call__(self, scope, receive, send):
+        token, token_source = self._extract_request_token(scope)
+        is_valid = bool(token) and hmac.compare_digest(token, self.token)
+        persist_query_token = (
+            scope.get("type") == "http" and token_source == "query" and is_valid
+        )
+
         if not self._requires_auth(scope):
-            return await self.app(scope, receive, send)
+            if not persist_query_token:
+                return await self.app(scope, receive, send)
 
-        token = self._extract_header_token(scope)
-        if token is None:
-            if scope.get("type") == "websocket":
-                token = self._extract_ws_protocol_token(scope)
-            token = token or self._extract_query_token(scope)
+            async def send_with_cookie(message):
+                if message.get("type") == "http.response.start":
+                    headers = message.setdefault("headers", [])
+                    headers.append(
+                        (
+                            b"set-cookie",
+                            self._build_auth_cookie(token, scope).encode("latin-1"),
+                        )
+                    )
+                await send(message)
 
-        if not token or not hmac.compare_digest(token, self.token):
+            return await self.app(scope, receive, send_with_cookie)
+
+        if not is_valid:
             if scope.get("type") == "websocket":
                 return await self._reject_ws(scope, receive, send)
             return await self._reject_http(scope, receive, send)
 
-        return await self.app(scope, receive, send)
+        if not persist_query_token:
+            return await self.app(scope, receive, send)
+
+        async def send_with_cookie(message):
+            if message.get("type") == "http.response.start":
+                headers = message.setdefault("headers", [])
+                headers.append(
+                    (
+                        b"set-cookie",
+                        self._build_auth_cookie(token, scope).encode("latin-1"),
+                    )
+                )
+            await send(message)
+
+        return await self.app(scope, receive, send_with_cookie)
 
 
 class HostOriginMiddleware:

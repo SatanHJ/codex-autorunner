@@ -3,7 +3,11 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from codex_autorunner.bootstrap import seed_hub_files, seed_repo_files
-from codex_autorunner.core.config import load_hub_config
+from codex_autorunner.core.config import (
+    CONFIG_FILENAME,
+    load_hub_config,
+    save_hub_config_data,
+)
 from codex_autorunner.manifest import load_manifest, save_manifest
 from codex_autorunner.server import create_hub_app
 
@@ -58,3 +62,73 @@ def test_hub_routes_under_base_path(tmp_path: Path) -> None:
     assert client.get("/car/hub/version").status_code == 200
     assert client.get("/car/repos/demo/api/version").status_code == 200
     assert client.get("/car/repos/demo/static/generated/app.js").status_code == 200
+
+
+def _create_auth_enabled_hub_app(tmp_path: Path, monkeypatch, *, token: str = "secret"):
+    seed_hub_files(tmp_path, force=True)
+    save_hub_config_data(
+        tmp_path / CONFIG_FILENAME,
+        {
+            "version": 2,
+            "mode": "hub",
+            "server": {"auth_token_env": "CAR_TEST_AUTH_TOKEN"},
+        },
+        generated=True,
+    )
+    monkeypatch.setenv("CAR_TEST_AUTH_TOKEN", token)
+    repo_dir = tmp_path / "demo"
+    (repo_dir / ".git").mkdir(parents=True, exist_ok=True)
+    seed_repo_files(repo_dir, force=True, git_required=False)
+    hub_config = load_hub_config(tmp_path)
+    manifest = load_manifest(hub_config.manifest_path, tmp_path)
+    manifest.ensure_repo(tmp_path, repo_dir, repo_id="demo", display_name="demo")
+    save_manifest(hub_config.manifest_path, manifest, tmp_path)
+    return create_hub_app(tmp_path, base_path="/car")
+
+
+def test_query_token_persists_across_full_navigation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _create_auth_enabled_hub_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        landing = client.get("/car/?token=secret")
+
+        assert landing.status_code == 200
+        assert "car_auth_token=secret" in landing.headers.get("set-cookie", "")
+        assert "HttpOnly" in landing.headers.get("set-cookie", "")
+        assert "Path=/car" in landing.headers.get("set-cookie", "")
+
+        repo_page = client.get("/car/repos/demo/")
+
+        assert repo_page.status_code == 200
+
+
+def test_query_token_overrides_stale_cookie_for_navigation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _create_auth_enabled_hub_app(tmp_path, monkeypatch)
+
+    with TestClient(app) as client:
+        client.cookies.set(
+            "car_auth_token",
+            "stale",
+            domain="testserver.local",
+            path="/car",
+        )
+
+        assert client.get("/car/repos/demo/").status_code == 401
+
+        refreshed = client.get("/car/repos/demo/?token=secret")
+
+        assert refreshed.status_code == 200
+        assert "car_auth_token=secret" in refreshed.headers.get("set-cookie", "")
+        assert (
+            client.cookies.get(
+                "car_auth_token",
+                domain="testserver.local",
+                path="/car",
+            )
+            == "secret"
+        )
+        assert client.get("/car/repos/demo/").status_code == 200
